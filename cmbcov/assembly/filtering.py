@@ -180,10 +180,13 @@ import time
 from collections.abc import Callable, Mapping, Sequence
 from typing import NamedTuple
 
+import ducc0
 import numpy as np
 
 from ..exact.common import mask_coupling_width
 from ..harmonics.grid import (
+    _gl_geometry,
+    _nthreads,
     gl_analysis,
     gl_minimal_lmax,
     gl_shape,
@@ -199,7 +202,7 @@ __all__ = [
     "channels_for",
     "highpass_profile",
     "lowpass_profile",
-    "scan_lx",
+    "scan_m",
     "notch_profile",
     "combined_profile",
     "FourierRingFilter",
@@ -402,56 +405,53 @@ def lowpass_profile(
         return np.exp(-((M / mc) ** power))
 
 
-def scan_lx(f: float, v_scan: float) -> float:
+def scan_m(f: float, v_az: float) -> float:
     r"""
-    The wavenumber :math:`\ell_x = 360 f / v_{scan}` seen at time frequency
-    ``f`` (Hz) by a scan at the constant speed *on the sky* ``v_scan``
-    (deg/s): a flat-sky mode :math:`\ell` swept at that speed has frequency
-    :math:`f = \ell v_{scan} / 360`, and a ring at colatitude :math:`\theta`
-    sees it at the azimuthal order :math:`\ell_x \sin\theta`, the convention
-    of every profile here.  (For a constant *azimuthal* rate
-    :math:`d\phi/dt` instead, the cut would be :math:`360 f / v` on every
-    ring, with no :math:`\sin\theta`; that is not this convention.)
+    The azimuthal order :math:`M = 360 f / v_{az}` seen at time frequency
+    ``f`` (Hz) by a scan at the constant azimuthal rate
+    :math:`d\phi/dt = v_{az}` (deg/s): the mode :math:`e^{iM\phi}` of a ring
+    is swept at :math:`f = M v_{az} / 360` whatever the colatitude, so a
+    time-frequency filter cuts the same ``M`` on every ring (unlike the
+    physical-scale cuts ``lx`` of the other profiles, at
+    :math:`\ell_x \sin\theta`).
     """
-    f, v_scan = float(f), float(v_scan)
+    f, v_az = float(f), float(v_az)
     if not np.isfinite(f) or f < 0:
         raise ValueError(f"f must be finite and non-negative, got {f}")
-    if not np.isfinite(v_scan) or v_scan <= 0:
-        raise ValueError(f"v_scan must be finite and positive, got {v_scan}")
-    return 360.0 * f / v_scan
+    if not np.isfinite(v_az) or v_az <= 0:
+        raise ValueError(f"v_az must be finite and positive, got {v_az}")
+    return 360.0 * f / v_az
 
 
-def _check_notch(lx_lo: float, lx_hi: float) -> tuple[float, float]:
-    """``(lx_lo, lx_hi)`` as floats, checked: finite, ``0 < lx_lo < lx_hi``."""
-    lx_lo, lx_hi = float(lx_lo), float(lx_hi)
-    if not (np.isfinite(lx_lo) and np.isfinite(lx_hi) and 0 < lx_lo < lx_hi):
+def _check_notch(m_lo: float, m_hi: float) -> tuple[float, float]:
+    """``(m_lo, m_hi)`` as floats, checked: finite, ``0 <= m_lo < m_hi``."""
+    m_lo, m_hi = float(m_lo), float(m_hi)
+    if not (np.isfinite(m_lo) and np.isfinite(m_hi) and 0 <= m_lo < m_hi):
         raise ValueError(
-            f"the notch needs finite 0 < lx_lo < lx_hi, got ({lx_lo}, {lx_hi})"
+            f"the notch needs finite 0 <= m_lo < m_hi, got ({m_lo}, {m_hi})"
         )
-    return lx_lo, lx_hi
+    return m_lo, m_hi
 
 
-def notch_profile(lmax_grid: int, lx_lo: float, lx_hi: float) -> np.ndarray:
+def notch_profile(lmax_grid: int, m_lo: float, m_hi: float) -> np.ndarray:
     r"""
-    Sharp notch ring-filter profile :math:`h(\theta_j, M)` on a GL grid.
+    Sharp time-frequency notch ring-filter profile :math:`h(\theta_j, M)` on
+    a GL grid.
 
-    :math:`h = 0` where :math:`\ell_{lo} \sin\theta < M \le \ell_{hi}
-    \sin\theta`, else 1: exactly the sharp :func:`lowpass_profile` at
-    ``lx_lo`` plus the sharp :func:`highpass_profile` at ``lx_hi`` (which
-    do not overlap).  For a time-stream notch ``[f_lo, f_hi]`` (Hz) at the
-    scan speed ``v_scan`` (deg/s on the sky), ``lx_lo = scan_lx(f_lo,
-    v_scan)`` and ``lx_hi = scan_lx(f_hi, v_scan)`` (:func:`scan_lx`).
-
-    A ring whose notch ``(lx_hi - lx_lo) sin(theta)`` holds no integer
-    ``M`` is left unfiltered: its frequency resolution, ``v_scan / (360
-    sin(theta))``, is coarser than the notch.
+    :math:`h = 0` where :math:`m_{lo} \le M \le m_{hi}`, else 1, the same
+    on every ring.  For a time-stream notch ``[f_lo, f_hi]`` (Hz) at the
+    constant azimuthal rate ``v_az`` (deg/s), ``m_lo = scan_m(f_lo, v_az)``
+    and ``m_hi = scan_m(f_hi, v_az)`` (:func:`scan_m`).  Since ``h`` does not
+    depend on :math:`\theta` the filter is diagonal in harmonic space: it
+    zeroes the :math:`a_{\ell m}` with :math:`m_{lo} \le |m| \le m_{hi}`.
+    A notch holding no integer ``M`` filters nothing.
 
     Parameters
     ----------
     lmax_grid : int
         GL grid band-limit (:func:`~cmbcov.harmonics.grid.gl_shape`).
-    lx_lo, lx_hi : float
-        Edges of the notch, finite, ``0 < lx_lo < lx_hi``.
+    m_lo, m_hi : float
+        Edges of the notch in azimuthal order, finite, ``0 <= m_lo < m_hi``.
 
     Returns
     -------
@@ -459,10 +459,11 @@ def notch_profile(lmax_grid: int, lx_lo: float, lx_hi: float) -> np.ndarray:
         float64 array of shape ``(ntheta, nphi // 2 + 1)``, as for
         :func:`highpass_profile`.
     """
-    lx_lo, lx_hi = _check_notch(lx_lo, lx_hi)
-    return lowpass_profile(lmax_grid, lx_lo, "sharp") + highpass_profile(
-        lmax_grid, lx_hi, "sharp"
-    )
+    m_lo, m_hi = _check_notch(m_lo, m_hi)
+    ntheta, nphi = gl_shape(lmax_grid)
+    M = np.arange(nphi // 2 + 1, dtype=float)
+    row = 1.0 - ((M >= m_lo) & (M <= m_hi))
+    return np.tile(row, (ntheta, 1))
 
 
 def combined_profile(
@@ -492,17 +493,17 @@ def combined_profile(
         (otherwise the band is empty).  ``None`` (the default): the
         high-pass alone, exactly :func:`highpass_profile`.
     notch : mapping, optional
-        ``{"lx_lo": ..., "lx_hi": ...}``, both required, as for
+        ``{"m_lo": ..., "m_hi": ...}``, both required, as for
         :func:`notch_profile`.  ``None`` (the default): no notch, and the
         result is exactly that without this argument.
     """
     h = highpass_profile(lmax_grid, lx, shape, power)
     if notch is not None:
-        if set(notch) != {"lx_lo", "lx_hi"}:
+        if set(notch) != {"m_lo", "m_hi"}:
             raise ValueError(
-                f"notch must be a mapping with 'lx_lo' and 'lx_hi'; got {dict(notch)!r}"
+                f"notch must be a mapping with 'm_lo' and 'm_hi'; got {dict(notch)!r}"
             )
-        h = h * notch_profile(lmax_grid, notch["lx_lo"], notch["lx_hi"])
+        h = h * notch_profile(lmax_grid, notch["m_lo"], notch["m_hi"])
     if lowpass is None:
         return h
     extra = sorted(set(lowpass) - {"lx", "shape", "power"})
@@ -609,13 +610,13 @@ LOWPASS_DIVISOR = 15
 #: ``lx_lowpass`` are spaced ``lx_lowpass / LOWPASS_ONSET_DIVISOR`` apart.
 LOWPASS_ONSET_RANGE = (0.95, 1.15)
 LOWPASS_ONSET_DIVISOR = 50
-#: A sharp notch ``(lx_lo, lx_hi]`` starts removing modes at ``lx_lo`` with
-#: the square-root onset of a sharp low-pass, and its upper edge is a sharp
-#: high-pass cut at ``lx_hi``: the nodes at ``lx_lo`` follow
-#: :data:`LOWPASS_ONSET_RANGE` (``/ LOWPASS_ONSET_DIVISOR``) inside
-#: ``NOTCH_RANGE`` (``/ NEAR_CUT_DIVISOR``), those at ``lx_hi``
-#: ``NOTCH_RANGE`` (``/ NEAR_CUT_DIVISOR``), both in units of their edge.
-#: By analogy with those two filters; not validated against exact rows.
+#: A notch ``[m_lo, m_hi]`` (:func:`notch_profile`) removes from degree
+#: ``l`` about the fraction ``2 (min(l, m_hi) - m_lo) / (2 l + 1)`` of its
+#: modes: none below ``m_lo``, rising linearly to a kink at ``m_hi``, then
+#: falling as ``1 / l``.  Around each kink the nodes are spaced ``edge /
+#: LOWPASS_ONSET_DIVISOR`` over :data:`LOWPASS_ONSET_RANGE`, and ``edge /
+#: NEAR_CUT_DIVISOR`` over ``NOTCH_RANGE`` (both in units of the edge).
+#: By analogy with the other filters; not validated against exact rows.
 NOTCH_RANGE = (0.95, 2.0)
 
 
@@ -646,31 +647,44 @@ def _round_half_up(x: float) -> int:
     return int(np.floor(x + 0.5))
 
 
-def _notch_groups(lx_lo: float, lx_hi: float, last: int) -> list:
-    """The ``(dense nodes, step)`` groups of a notch (:data:`NOTCH_RANGE`),
-    the fine onset nodes at ``lx_lo`` replacing the coarse ones in their
-    stretch, and the nodes at ``lx_hi`` replacing the coarse ones of
-    ``lx_lo`` from their first one up (but not the fine ones); nodes outside
-    ``1 .. last`` dropped."""
-    groups = []
-    for scale, (a, b), divisor in (
-        (lx_lo, NOTCH_RANGE, NEAR_CUT_DIVISOR),
-        (lx_lo, LOWPASS_ONSET_RANGE, LOWPASS_ONSET_DIVISOR),
-        (lx_hi, NOTCH_RANGE, NEAR_CUT_DIVISOR),
-    ):
+def _notch_groups(m_lo: float, m_hi: float, last: int) -> list:
+    """The ``(dense nodes, step)`` groups of a notch (:data:`NOTCH_RANGE`):
+    at each edge (``m_lo`` taken as at least 1) coarse nodes, replaced by
+    the fine ones around the kink in their stretch (and within half a coarse
+    step of it); the coarse nodes of
+    ``m_lo`` stop where those of ``m_hi`` start, and fine stretches that
+    overlap are merged.  Nodes outside ``1 .. last`` dropped."""
+
+    def dense(scale, a, b, divisor):
         step = max(1, _round_half_up(scale / divisor))
-        dense = range(
+        nodes = range(
             _round_half_up(a * scale), int(np.floor(b * scale + 1e-9)) + 1, step
         )
-        groups.append(([n for n in dense if 1 <= n <= last], step))
-    (coarse, step_c), (fine, step_f), (high, step_h) = groups
-    if fine:
-        coarse = [n for n in coarse if not fine[0] <= n <= fine[-1]]
-    if high:
-        coarse = [n for n in coarse if n < high[0]]
-    if fine:
-        high = [n for n in high if not fine[0] <= n <= fine[-1]]
-    return [g for g in ((coarse, step_c), (fine, step_f), (high, step_h)) if g[0]]
+        return [n for n in nodes if 1 <= n <= last], step
+
+    lo = max(m_lo, 1.0)
+    coarse_lo, step_lo = dense(lo, *NOTCH_RANGE, NEAR_CUT_DIVISOR)
+    coarse_hi, step_hi = dense(m_hi, *NOTCH_RANGE, NEAR_CUT_DIVISOR)
+    fines = [
+        dense(lo, *LOWPASS_ONSET_RANGE, LOWPASS_ONSET_DIVISOR),
+        dense(m_hi, *LOWPASS_ONSET_RANGE, LOWPASS_ONSET_DIVISOR),
+    ]
+    fines = [f for f in fines if f[0]]
+    if len(fines) == 2 and fines[1][0][0] <= fines[0][0][-1]:
+        (f0, s0), (f1, _) = fines
+        merged = [n for n in range(f0[0], f1[-1] + 1, s0) if n <= last]
+        fines = [(merged, s0)]
+    if coarse_hi:
+        coarse_lo = [n for n in coarse_lo if n < coarse_hi[0]]
+    for fine, _ in fines:
+        coarse_lo = [
+            n for n in coarse_lo if not fine[0] - step_lo / 2 < n < fine[-1] + step_lo / 2
+        ]
+        coarse_hi = [
+            n for n in coarse_hi if not fine[0] - step_hi / 2 < n < fine[-1] + step_hi / 2
+        ]
+    groups = [(coarse_lo, step_lo), (coarse_hi, step_hi), *fines]
+    return [g for g in groups if g[0]]
 
 
 def default_nodes(
@@ -719,10 +733,10 @@ def default_nodes(
         Shape of that low-pass; the ``"sharp"`` one gets extra nodes at its
         onset.
     notch : (float, float), optional
-        Edges ``(lx_lo, lx_hi)`` of a sharp notch (:func:`notch_profile`);
-        needs ``lx``.  ``None`` (the default): no notch nodes, and the list
+        Edges ``(m_lo, m_hi)``, in azimuthal order, of a time-frequency
+        notch (:func:`notch_profile`); needs ``lx``.  ``None`` (the default): no notch nodes, and the list
         is exactly the one without this argument.  Otherwise the nodes of
-        :data:`NOTCH_RANGE` at both edges are added, the geometric nodes
+        :data:`NOTCH_RANGE` around both edges are added, the geometric nodes
         dropped by the same rule as for the cut.
 
     Returns
@@ -915,7 +929,7 @@ def node_plan(
         dense node) to below ``2 lx`` (:data:`NEAR_CUT_PROBE_LIMIT`), and,
         with a low-pass, of the nodes from ``round(0.6 lx_lowpass)`` to below
         ``2 lx_lowpass`` (:data:`LOWPASS_RANGE`), and, with a notch, of the
-        nodes from ``round(0.95 lx_lo)`` to below ``2 lx_hi``.
+        nodes from ``round(0.95 max(m_lo, 1))`` to below ``2 m_hi``.
         ``None`` (the default): the complete basis of the degree, ``2 l' +
         1`` vectors, which makes the node's ratio exact.  A count at least
         ``2 l' + 1`` also gives the complete basis.
@@ -929,10 +943,9 @@ def node_plan(
         0 for the others.  The nodes below ``0.95 lx`` keep ``nprobe`` and no
         floor: the transfer function is near zero there and their bins are
         not usable anyway (:data:`FL_CUT`), while the complete basis and a
-        raised band-limit would cost as much as near the cut.  With a notch
-        the nodes from ``round(0.95 lx_lo)`` to below ``1.3 lx_hi`` get the
-        floor ``ceil(3.5 lx_hi)`` (its edges are sharp cuts, like the
-        high-pass), or the high-pass one if larger.
+        raised band-limit would cost as much as near the cut.  A notch adds
+        no floor: it is diagonal in harmonic space and scatters no power
+        across multipoles.
 
     Notes
     -----
@@ -996,23 +1009,19 @@ def node_plan(
         lp_start = _round_half_up(LOWPASS_RANGE[0] * float(lx_lowpass))
         lp_stop = LOWPASS_RANGE[1] * float(lx_lowpass)
     if notch is not None:
-        lx_lo, lx_hi = _check_notch(*notch)
-        notch_start = _round_half_up(NOTCH_RANGE[0] * lx_lo)
-        notch_floor = int(np.ceil(BANDLIMIT_FLOOR * lx_hi))
+        m_lo, m_hi = _check_notch(*notch)
+        notch_start = _round_half_up(NOTCH_RANGE[0] * max(m_lo, 1.0))
     for n in nodes:
         near = start <= n < NEAR_CUT_PROBE_LIMIT * lx
         if lp_start is not None:
             near = near or lp_start <= n < lp_stop
         if notch is not None:
-            near = near or notch_start <= n < NOTCH_RANGE[1] * lx_hi
+            near = near or notch_start <= n < NOTCH_RANGE[1] * m_hi
         if near:
             probes.append(2 * n + 1 if nprobe_near_cut is None else nprobe_near_cut)
         else:
             probes.append(nprobe)
-        fl = floor if start <= n < BANDLIMIT_NODE_LIMIT * lx else 0
-        if notch is not None and notch_start <= n < BANDLIMIT_NODE_LIMIT * lx_hi:
-            fl = max(fl, notch_floor)
-        floors.append(fl)
+        floors.append(floor if start <= n < BANDLIMIT_NODE_LIMIT * lx else 0)
     return NodePlan(nodes, probes, floors)
 
 
@@ -1201,6 +1210,102 @@ def _node_sums(
     return exact, count, sums
 
 
+#: Largest fraction of the mask's power in orders ``m > 0`` that
+#: ``method="alm"`` of :func:`filtered_sum_rule_ratio` accepts as
+#: azimuthally symmetric.
+_SYMMETRIC_TOLERANCE = 1e-10
+
+
+def _check_symmetric_mask(mask_alm: np.ndarray, lw: int) -> None:
+    """Raise unless the mask's power in ``m > 0`` is at most
+    :data:`_SYMMETRIC_TOLERANCE` of its total power."""
+    import healpy as hp  # lazy, see utils/healpy_utils.py
+
+    m = hp.Alm.getlm(lw)[1]
+    power = np.abs(mask_alm) ** 2
+    total = power[m == 0].sum() + 2 * power[m > 0].sum()
+    if total > 0 and 2 * power[m > 0].sum() > _SYMMETRIC_TOLERANCE * total:
+        raise ValueError(
+            "method='alm' needs a mask symmetric about the scan axis (no m > 0 "
+            f"alm); this one has {2 * power[m > 0].sum() / total:.3g} of its "
+            "power in m > 0"
+        )
+
+
+def _node_sums_alm(
+    w_ring: np.ndarray,
+    h: np.ndarray,
+    ellp: int,
+    lmax_int: int,
+    lg: int,
+    channels: Sequence[str],
+    nthreads: int | None,
+) -> tuple[bool, int, dict[str, tuple[np.ndarray, np.ndarray]]]:
+    r"""
+    The sums of :func:`_node_sums` for its complete basis, computed order by
+    order for a mask ``W(theta)`` symmetric about the scan axis
+    (``method="alm"`` of :func:`filtered_sum_rule_ratio`).
+
+    With such a mask every operator commutes with rotations about the axis,
+    so it acts on each order ``m`` separately: ``K^(m) = A_m D_m S_m``
+    with ``S_m`` the Legendre synthesis of order ``m`` (``alm2leg``),
+    ``A_m`` its adjoint (``leg2alm`` of the legs times the ring weights
+    ``2 pi w_GL``) and ``D_m`` the multiplication of ring ``j`` by
+    ``W(theta_j) h(theta_j, m)`` (by ``W(theta_j)`` unfiltered); ``K`` and
+    :math:`K^\dagger` are the same there.  The basis vectors of order ``m``
+    (one at ``m = 0``, ``1/sqrt 2`` and ``i/sqrt 2`` for ``m > 0``) add
+    :math:`|y_\ell|^2` and :math:`2 |y_\ell|^2` to the sums, ``y`` the
+    channel's operator applied to the unit vector at ``l'``.  The same
+    grid, rings and band-limit as the probes: at a node probed with the
+    complete basis both methods agree to round-off.
+    """
+    geom = _gl_geometry(lg)
+    theta, wbar = geom["theta"], geom["wbar"]
+    size = lmax_int + 1
+    spin0 = "00" in channels
+    spin2 = ("20" in channels or "EE" in channels) and ellp >= 2
+    sums = {ch: (np.zeros(size), np.zeros(size)) for ch in channels}
+    nt = _nthreads(nthreads, lg)
+    ones = np.ones_like(h[:, 0])
+
+    for m in range(ellp + 1):
+        mval = np.array([m], dtype=np.int64)
+        mstart = np.zeros(1, dtype=np.int64)
+
+        def op(alm, spin, ring):
+            # A_m D_m S_m on the order-m coefficients alm (ncomp, size)
+            leg = ducc0.sht.alm2leg(
+                alm=alm, lmax=lmax_int, theta=theta, spin=spin,
+                mval=mval, mstart=mstart, nthreads=nt,
+            )
+            leg *= (wbar * w_ring * ring)[None, :, None]
+            # leg2alm writes only l >= m: the rest must start at zero
+            out = np.zeros_like(alm)
+            return ducc0.sht.leg2alm(
+                leg=leg, lmax=lmax_int, theta=theta, spin=spin,
+                mval=mval, mstart=mstart, nthreads=nt, alm=out,
+            )
+
+        weight = 1.0 if m == 0 else 2.0
+        z = np.zeros((1, size), dtype=complex)
+        z[0, ellp] = 1.0
+        for index, ring in ((0, h[:, m]), (1, ones)):
+            if spin0:
+                y = op(op(z, 0, ring), 0, ring)[0]
+                sums["00"][index][:] += weight * np.abs(y) ** 2
+            if spin2:
+                z2 = np.concatenate([z, np.zeros_like(z)])
+                u = op(z2, 2, ring)[0][None, :]  # [K_2^dagger (z, 0)]_E
+                if "20" in channels:
+                    y = op(u, 0, ring)[0]
+                    sums["20"][index][:] += weight * np.abs(y) ** 2
+                if "EE" in channels:
+                    u2 = np.concatenate([u, np.zeros_like(u)])
+                    y = op(u2, 2, ring)[0]
+                    sums["EE"][index][:] += weight * np.abs(y) ** 2
+    return True, 2 * ellp + 1, sums
+
+
 def _ratio_by_distance(
     sum_f: np.ndarray, sum_u: np.ndarray, ellp: int, dmax: int
 ) -> np.ndarray:
@@ -1267,9 +1372,12 @@ def filtered_sum_rule_ratio(
     lmax_int_floor: int | Sequence[int] | None = None,
     nthreads: int | None = None,
     verbose: bool = False,
+    method: str = "map",
 ) -> dict[str, np.ndarray]:
     r"""
-    :math:`\rho^{ch} = \Xi^{F,ch} / \Xi^{ch}` at the nodes, by paired probing.
+    :math:`\rho^{ch} = \Xi^{F,ch} / \Xi^{ch}` at the nodes, by paired probing
+    (``method="map"``) or exactly, order by order, for a mask symmetric about
+    the scan axis (``method="alm"``).
 
     For each node :math:`\ell'` the probes ``z`` of degree :math:`\ell'` are
     pushed through the operator of each channel (module docstring,
@@ -1327,6 +1435,17 @@ def filtered_sum_rule_ratio(
         Threads for the ducc0 transforms.
     verbose : bool
         Print one line per node (grid, probes, time).
+    method : {"map", "alm"}
+        ``"map"`` (the default): the probes above, pushed through the ring
+        filter on the GL map, for any mask.  ``"alm"``: the exact sums of
+        the complete basis, computed order by order (:func:`_node_sums_alm`)
+        on the same grid; the mask must be symmetric about the scan axis
+        (its power in ``m > 0`` at most :data:`_SYMMETRIC_TOLERANCE` of the
+        total, else ``ValueError``), ``nprobe`` and ``seed`` are ignored.
+        It costs about ``(l' + 1) / lmax_int`` full transforms per channel
+        operator, against ``nprobe`` of them for the probes, and serves as
+        an exact reference for the probes and the node plan: any ring
+        filter, the notch alone being diagonal in :math:`a_{\ell m}`.
 
     Returns
     -------
@@ -1361,15 +1480,36 @@ def filtered_sum_rule_ratio(
     spin-2 transform costs two to three spin-0 ones.
     """
     channels = _check_channels(channels)
+    if method not in ("map", "alm"):
+        raise ValueError(f"method must be 'map' or 'alm', got {method!r}")
     mask_alm, lw, nodes, dmax, nprobe, margin, floors = _check_probe_arguments(
         mask_alm, lw, profile, nodes, dmax, nprobe, margin, lmax_int_floor
     )
+    probe_work = lambda ellp: _white_probe_work(channels, ellp)  # noqa: E731
 
-    def node(w_map, filt, ellp, lmax_int, lg, node_nprobe):
-        exact, count, sums = _node_sums(
-            w_map, filt, ellp, lmax_int, lg, channels, node_nprobe, seed, nthreads
-        )
-        return exact, count, {ch: sums[ch] for ch in channels}
+    if method == "alm":
+        _check_symmetric_mask(mask_alm, lw)
+        # one "probe" per basis vector, each about a 1 / lmax_int share of
+        # the probe's transforms and no ring filter (progress weights only)
+        nprobe = [2 * ellp + 1 for ellp in nodes]
+
+        def probe_work(ellp):
+            share = 1.0 / (ellp + dmax + margin + 1)
+            return 0.0, _white_probe_work(channels, ellp)[1] * share
+
+        def node(w_map, filt, ellp, lmax_int, lg, node_nprobe):
+            exact, count, sums = _node_sums_alm(
+                w_map[:, 0], filt.h, ellp, lmax_int, lg, channels, nthreads
+            )
+            return exact, count, {ch: sums[ch] for ch in channels}
+
+    else:
+
+        def node(w_map, filt, ellp, lmax_int, lg, node_nprobe):
+            exact, count, sums = _node_sums(
+                w_map, filt, ellp, lmax_int, lg, channels, node_nprobe, seed, nthreads
+            )
+            return exact, count, {ch: sums[ch] for ch in channels}
 
     return _over_nodes(
         "filtered_sum_rule_ratio",
@@ -1387,7 +1527,7 @@ def filtered_sum_rule_ratio(
         verbose,
         channels,
         node,
-        lambda ellp: _white_probe_work(channels, ellp),
+        probe_work,
     )
 
 

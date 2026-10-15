@@ -21,6 +21,12 @@ complete-basis probes against exact filtered and unfiltered rows with
 different spectra on the two sides, one and two frequencies; the no-filter
 limit; seeds, nodes, the spectrum-length cap and the grid oversampling.
 
+Section 10 covers the time-frequency notch (``scan_m``, ``notch_profile``,
+its nodes) and ``method="alm"`` of ``filtered_sum_rule_ratio``: on a mask
+symmetric about the scan pole, the order-by-order sums against the
+complete-basis probes, to round-off, for theta-dependent and
+theta-independent cuts in all three channels.
+
 Masks are built analytically on a GL grid and band-limited with
 ``gl_analysis``; nothing is read from disk.
 """
@@ -1967,3 +1973,151 @@ def test_pre_filter_noise_and_block_id():
         pre_filter_noise(nl, fl[:3])
     key = CovKey(("T", "T", "T", "T"), ("090GHz", "150GHz", "090GHz", "090GHz"))
     assert block_id(key) == "TTxTT_090GHz150GHzx090GHz090GHz"
+
+
+# --------------------------------------------------------------------------- #
+# 10. Time-frequency notch and the order-by-order method="alm"
+# --------------------------------------------------------------------------- #
+def test_notch_profile_values():
+    from cmbcov.assembly.filtering import notch_profile, scan_m
+
+    assert scan_m(1.0, 1.0) == 360.0
+    assert scan_m(1.5, 0.5) == 1080.0
+    with pytest.raises(ValueError, match="v_az"):
+        scan_m(1.0, 0.0)
+    with pytest.raises(ValueError, match="f must"):
+        scan_m(-1.0, 1.0)
+
+    lg = 40
+    h = notch_profile(lg, 10, 20.5)
+    assert h.shape == (gl_shape(lg)[0], gl_shape(lg)[1] // 2 + 1)
+    assert (h == h[0]).all()  # the same M on every ring
+    expected = np.ones(h.shape[1])
+    expected[10:21] = 0.0  # closed interval [m_lo, m_hi]
+    np.testing.assert_array_equal(h[0], expected)
+    assert notch_profile(lg, 0, 3)[0, 0] == 0.0
+    for bad in [(-1, 5), (5, 5), (6, 5), (1, np.inf)]:
+        with pytest.raises(ValueError, match="notch"):
+            notch_profile(lg, *bad)
+
+
+def test_combined_profile_with_notch():
+    from cmbcov.assembly.filtering import notch_profile
+
+    lg = 40
+    notch = {"m_lo": 12, "m_hi": 18}
+    h = combined_profile(lg, 5.0, "sharp", 6.0, notch=notch)
+    np.testing.assert_array_equal(h, highpass_profile(lg, 5.0) * notch_profile(lg, 12, 18))
+    low = {"lx": 30.0}
+    np.testing.assert_array_equal(
+        combined_profile(lg, 5.0, "exp", 4.0, low, notch),
+        combined_profile(lg, 5.0, "exp", 4.0, low) * notch_profile(lg, 12, 18),
+    )
+    np.testing.assert_array_equal(
+        combined_profile(lg, 5.0, notch=None), highpass_profile(lg, 5.0)
+    )
+    with pytest.raises(ValueError, match="m_lo"):
+        combined_profile(lg, 5.0, notch={"m_lo": 12})
+    with pytest.raises(ValueError, match="m_lo"):
+        combined_profile(lg, 5.0, notch={"lx_lo": 12, "lx_hi": 18})
+
+
+def test_nodes_through_a_notch():
+    from cmbcov.assembly.filtering import node_plan
+
+    base = default_nodes(1001, lx=100)
+    assert default_nodes(1001, lx=100, notch=None) == base
+    assert default_nodes(1001, lx=100, near_cut_step=0, notch=(300, 400)) == (
+        default_nodes(1001)
+    )
+    for notch in [(300, 400), (300, 310), (0, 50)]:
+        nodes = default_nodes(1001, lx=100, notch=notch)
+        assert nodes == sorted(set(nodes)) and nodes[-1] == 1000
+        assert set(nodes) > set(n for n in base if n < 0.95 * max(notch[0], 1))
+    nodes = default_nodes(1001, lx=100, notch=(300, 400))
+    near = [n for n in nodes if 285 <= n <= 800]
+    assert min(np.diff(near)) >= 5  # fine and coarse stretches do not crowd
+    assert any(285 <= n <= 345 for n in nodes)  # fine nodes at both kinks
+    assert any(380 <= n <= 460 for n in nodes)
+    with pytest.raises(ValueError, match="notch needs lx"):
+        default_nodes(1001, notch=(300, 400))
+
+    assert node_plan(1001, 32, 1.25, 100) == node_plan(1001, 32, 1.25, 100, notch=None)
+    plan = node_plan(1001, 32, 1.25, 100, nprobe_near_cut=128, notch=(300, 400))
+    for n, probes, floor in zip(*plan):
+        assert probes == (128 if 95 <= n < 200 or 285 <= n < 800 else 32)
+        assert floor == (350 if 95 <= n < 130 else 0)  # the notch adds no floor
+
+
+#: The ring filters method="alm" is checked with: theta-dependent (high-pass,
+#: low-pass) and theta-independent (notch), alone and multiplied.
+_ALM_PROFILES = {
+    "highpass": functools.partial(highpass_profile, lx=15.0, shape="sharp"),
+    "notch": functools.partial(
+        combined_profile, lx=0.0, notch={"m_lo": 8, "m_hi": 14}
+    ),
+    "highpass_notch": functools.partial(
+        combined_profile, lx=10.0, notch={"m_lo": 18, "m_hi": 24}
+    ),
+    "exp_lowpass": functools.partial(
+        combined_profile, lx=8.0, shape="exp", lowpass={"lx": 25.0}
+    ),
+}
+
+
+@pytest.fixture(scope="module")
+def symmetric_band():
+    """A band in theta (symmetric about the scan pole, m = 0 only), lw = 32."""
+    lw, lg = 32, 64
+    th = gl_thetas(lg)
+    band = _taper((th - 35 * DEG) / (15 * DEG)) * _taper((95 * DEG - th) / (15 * DEG))
+    w = np.repeat(band[:, None], gl_shape(lg)[1], axis=1)
+    return gl_analysis(w, lw, lg), lw
+
+
+@pytest.mark.parametrize("name", sorted(_ALM_PROFILES))
+def test_alm_method_is_the_exact_basis(name, symmetric_band):
+    r"""
+    For a mask symmetric about the scan pole every operator conserves ``m``,
+    and ``method="alm"`` builds the complete-basis sums order by order, on
+    the same grid and band-limit: it must give the probes' complete basis
+    (``2 l' + 1 <= nprobe``) to round-off, in every channel, for a cut that
+    depends on theta as well as for one that does not.  The channels of a
+    node do not depend on which others are requested.
+    """
+    alm, lw = symmetric_band
+    prof = _ALM_PROFILES[name]
+    nodes, dmax = [3, 12, 20, 28], 8
+    chans = ("00", "20", "EE")
+    g_map = filtered_sum_rule_ratio(
+        alm, lw, prof, nodes, dmax, channels=chans, nprobe=10**6, nthreads=1
+    )
+    g_alm = filtered_sum_rule_ratio(
+        alm, lw, prof, nodes, dmax, channels=chans, method="alm", nthreads=1
+    )
+    for ch in chans:
+        np.testing.assert_allclose(g_alm[ch], g_map[ch], rtol=0, atol=1e-12)
+    assert 0.0 < g_alm["00"].min() < 0.99  # a genuine, non-trivial filter
+    for ch in chans:
+        alone = filtered_sum_rule_ratio(
+            alm, lw, prof, nodes, dmax, channels=(ch,), method="alm", nthreads=1
+        )
+        np.testing.assert_array_equal(alone[ch], g_alm[ch])
+
+
+def test_alm_method_notch_rows_below_the_notch_are_one(symmetric_band):
+    """A node ``l' < m_lo`` has no order in the notch: ``rho = 1`` exactly."""
+    alm, lw = symmetric_band
+    g = filtered_sum_rule_ratio(
+        alm, lw, _ALM_PROFILES["notch"], [2, 5, 7], 4, method="alm", nthreads=1
+    )["00"]
+    np.testing.assert_array_equal(g, 1.0)
+
+
+def test_alm_method_errors(symmetric_band, off_pole_cap):
+    alm, lw = symmetric_band
+    prof = _ALM_PROFILES["notch"]
+    with pytest.raises(ValueError, match="symmetric"):
+        filtered_sum_rule_ratio(off_pole_cap, OFF_LW, prof, [10], 2, method="alm")
+    with pytest.raises(ValueError, match="method"):
+        filtered_sum_rule_ratio(alm, lw, prof, [10], 2, method="pix")
