@@ -199,6 +199,8 @@ __all__ = [
     "channels_for",
     "highpass_profile",
     "lowpass_profile",
+    "scan_lx",
+    "notch_profile",
     "combined_profile",
     "FourierRingFilter",
     "default_nodes",
@@ -400,18 +402,83 @@ def lowpass_profile(
         return np.exp(-((M / mc) ** power))
 
 
+def scan_lx(f: float, v_scan: float) -> float:
+    r"""
+    The wavenumber :math:`\ell_x = 360 f / v_{scan}` seen at time frequency
+    ``f`` (Hz) by a scan at the constant speed *on the sky* ``v_scan``
+    (deg/s): a flat-sky mode :math:`\ell` swept at that speed has frequency
+    :math:`f = \ell v_{scan} / 360`, and a ring at colatitude :math:`\theta`
+    sees it at the azimuthal order :math:`\ell_x \sin\theta`, the convention
+    of every profile here.  (For a constant *azimuthal* rate
+    :math:`d\phi/dt` instead, the cut would be :math:`360 f / v` on every
+    ring, with no :math:`\sin\theta`; that is not this convention.)
+    """
+    f, v_scan = float(f), float(v_scan)
+    if not np.isfinite(f) or f < 0:
+        raise ValueError(f"f must be finite and non-negative, got {f}")
+    if not np.isfinite(v_scan) or v_scan <= 0:
+        raise ValueError(f"v_scan must be finite and positive, got {v_scan}")
+    return 360.0 * f / v_scan
+
+
+def _check_notch(lx_lo: float, lx_hi: float) -> tuple[float, float]:
+    """``(lx_lo, lx_hi)`` as floats, checked: finite, ``0 < lx_lo < lx_hi``."""
+    lx_lo, lx_hi = float(lx_lo), float(lx_hi)
+    if not (np.isfinite(lx_lo) and np.isfinite(lx_hi) and 0 < lx_lo < lx_hi):
+        raise ValueError(
+            f"the notch needs finite 0 < lx_lo < lx_hi, got ({lx_lo}, {lx_hi})"
+        )
+    return lx_lo, lx_hi
+
+
+def notch_profile(lmax_grid: int, lx_lo: float, lx_hi: float) -> np.ndarray:
+    r"""
+    Sharp notch ring-filter profile :math:`h(\theta_j, M)` on a GL grid.
+
+    :math:`h = 0` where :math:`\ell_{lo} \sin\theta < M \le \ell_{hi}
+    \sin\theta`, else 1: exactly the sharp :func:`lowpass_profile` at
+    ``lx_lo`` plus the sharp :func:`highpass_profile` at ``lx_hi`` (which
+    do not overlap).  For a time-stream notch ``[f_lo, f_hi]`` (Hz) at the
+    scan speed ``v_scan`` (deg/s on the sky), ``lx_lo = scan_lx(f_lo,
+    v_scan)`` and ``lx_hi = scan_lx(f_hi, v_scan)`` (:func:`scan_lx`).
+
+    A ring whose notch ``(lx_hi - lx_lo) sin(theta)`` holds no integer
+    ``M`` is left unfiltered: its frequency resolution, ``v_scan / (360
+    sin(theta))``, is coarser than the notch.
+
+    Parameters
+    ----------
+    lmax_grid : int
+        GL grid band-limit (:func:`~cmbcov.harmonics.grid.gl_shape`).
+    lx_lo, lx_hi : float
+        Edges of the notch, finite, ``0 < lx_lo < lx_hi``.
+
+    Returns
+    -------
+    ndarray
+        float64 array of shape ``(ntheta, nphi // 2 + 1)``, as for
+        :func:`highpass_profile`.
+    """
+    lx_lo, lx_hi = _check_notch(lx_lo, lx_hi)
+    return lowpass_profile(lmax_grid, lx_lo, "sharp") + highpass_profile(
+        lmax_grid, lx_hi, "sharp"
+    )
+
+
 def combined_profile(
     lmax_grid: int,
     lx: float,
     shape: str = "sharp",
     power: float = 6.0,
     lowpass: Mapping | None = None,
+    notch: Mapping | None = None,
 ) -> np.ndarray:
     r"""
     The ring-filter profile of a ``map_filter`` run: the high-pass
     :func:`highpass_profile` ``(lmax_grid, lx, shape, power)``, times the
-    low-pass :func:`lowpass_profile` if ``lowpass`` is given,
-    :math:`h = h_{\mathrm{high}} h_{\mathrm{low}}`.
+    low-pass :func:`lowpass_profile` if ``lowpass`` is given, times the
+    notch :func:`notch_profile` if ``notch`` is given,
+    :math:`h = h_{\mathrm{high}} h_{\mathrm{low}} h_{\mathrm{notch}}`.
 
     Parameters
     ----------
@@ -424,8 +491,18 @@ def combined_profile(
         :func:`lowpass_profile`; its ``lx`` must exceed the high-pass ``lx``
         (otherwise the band is empty).  ``None`` (the default): the
         high-pass alone, exactly :func:`highpass_profile`.
+    notch : mapping, optional
+        ``{"lx_lo": ..., "lx_hi": ...}``, both required, as for
+        :func:`notch_profile`.  ``None`` (the default): no notch, and the
+        result is exactly that without this argument.
     """
     h = highpass_profile(lmax_grid, lx, shape, power)
+    if notch is not None:
+        if set(notch) != {"lx_lo", "lx_hi"}:
+            raise ValueError(
+                f"notch must be a mapping with 'lx_lo' and 'lx_hi'; got {dict(notch)!r}"
+            )
+        h = h * notch_profile(lmax_grid, notch["lx_lo"], notch["lx_hi"])
     if lowpass is None:
         return h
     extra = sorted(set(lowpass) - {"lx", "shape", "power"})
@@ -532,6 +609,14 @@ LOWPASS_DIVISOR = 15
 #: ``lx_lowpass`` are spaced ``lx_lowpass / LOWPASS_ONSET_DIVISOR`` apart.
 LOWPASS_ONSET_RANGE = (0.95, 1.15)
 LOWPASS_ONSET_DIVISOR = 50
+#: A sharp notch ``(lx_lo, lx_hi]`` starts removing modes at ``lx_lo`` with
+#: the square-root onset of a sharp low-pass, and its upper edge is a sharp
+#: high-pass cut at ``lx_hi``: the nodes at ``lx_lo`` follow
+#: :data:`LOWPASS_ONSET_RANGE` (``/ LOWPASS_ONSET_DIVISOR``) inside
+#: ``NOTCH_RANGE`` (``/ NEAR_CUT_DIVISOR``), those at ``lx_hi``
+#: ``NOTCH_RANGE`` (``/ NEAR_CUT_DIVISOR``), both in units of their edge.
+#: By analogy with those two filters; not validated against exact rows.
+NOTCH_RANGE = (0.95, 2.0)
 
 
 def _check_lowpass_cut(lx: float, lx_lowpass: float, shape: str) -> float:
@@ -561,6 +646,33 @@ def _round_half_up(x: float) -> int:
     return int(np.floor(x + 0.5))
 
 
+def _notch_groups(lx_lo: float, lx_hi: float, last: int) -> list:
+    """The ``(dense nodes, step)`` groups of a notch (:data:`NOTCH_RANGE`),
+    the fine onset nodes at ``lx_lo`` replacing the coarse ones in their
+    stretch, and the nodes at ``lx_hi`` replacing the coarse ones of
+    ``lx_lo`` from their first one up (but not the fine ones); nodes outside
+    ``1 .. last`` dropped."""
+    groups = []
+    for scale, (a, b), divisor in (
+        (lx_lo, NOTCH_RANGE, NEAR_CUT_DIVISOR),
+        (lx_lo, LOWPASS_ONSET_RANGE, LOWPASS_ONSET_DIVISOR),
+        (lx_hi, NOTCH_RANGE, NEAR_CUT_DIVISOR),
+    ):
+        step = max(1, _round_half_up(scale / divisor))
+        dense = range(
+            _round_half_up(a * scale), int(np.floor(b * scale + 1e-9)) + 1, step
+        )
+        groups.append(([n for n in dense if 1 <= n <= last], step))
+    (coarse, step_c), (fine, step_f), (high, step_h) = groups
+    if fine:
+        coarse = [n for n in coarse if not fine[0] <= n <= fine[-1]]
+    if high:
+        coarse = [n for n in coarse if n < high[0]]
+    if fine:
+        high = [n for n in high if not fine[0] <= n <= fine[-1]]
+    return [g for g in ((coarse, step_c), (fine, step_f), (high, step_h)) if g[0]]
+
+
 def default_nodes(
     lmax: int,
     node_min: int = 32,
@@ -570,6 +682,7 @@ def default_nodes(
     near_cut_step: float | None = None,
     lx_lowpass: float | None = None,
     lowpass_shape: str = "exp",
+    notch: tuple[float, float] | None = None,
 ) -> list[int]:
     r"""
     Multipoles at which :math:`\rho` is computed: geometric, ending at
@@ -605,6 +718,12 @@ def default_nodes(
     lowpass_shape : {"exp", "sharp"}
         Shape of that low-pass; the ``"sharp"`` one gets extra nodes at its
         onset.
+    notch : (float, float), optional
+        Edges ``(lx_lo, lx_hi)`` of a sharp notch (:func:`notch_profile`);
+        needs ``lx``.  ``None`` (the default): no notch nodes, and the list
+        is exactly the one without this argument.  Otherwise the nodes of
+        :data:`NOTCH_RANGE` at both edges are added, the geometric nodes
+        dropped by the same rule as for the cut.
 
     Returns
     -------
@@ -692,6 +811,8 @@ def default_nodes(
     if lx is None:
         if lx_lowpass is not None:
             raise ValueError("lx_lowpass needs lx")
+        if notch is not None:
+            raise ValueError("notch needs lx")
         return nodes
     lx = float(lx)
     if not np.isfinite(lx) or lx <= 0:
@@ -704,6 +825,8 @@ def default_nodes(
     groups = []  # (dense nodes, step) of each range of dense nodes
     if lx_lowpass is not None:
         lx_lowpass = _check_lowpass_cut(lx, lx_lowpass, lowpass_shape)
+    if notch is not None:
+        notch = _check_notch(*notch)
     if near_cut_step is not None and float(near_cut_step) == 0:
         return nodes
     step = _near_cut_step(lx, near_cut_step)
@@ -736,6 +859,8 @@ def default_nodes(
                 [(coarse, step_c), (fine, step_f)] if coarse else [(fine, step_f)]
             )
         groups.extend(lp_groups)
+    if notch is not None:
+        groups.extend(_notch_groups(*notch, last))
     if not groups:
         return nodes
     kept = [
@@ -772,6 +897,7 @@ def node_plan(
     nprobe_near_cut: int | None = None,
     lx_lowpass: float | None = None,
     lowpass_shape: str = "exp",
+    notch: tuple[float, float] | None = None,
 ) -> NodePlan:
     r"""
     Nodes and per-node probe settings of a filter with cut ``lx``, for
@@ -780,7 +906,7 @@ def node_plan(
 
     Parameters
     ----------
-    lmax, node_min, ratio, lx, near_cut_step, lx_lowpass, lowpass_shape :
+    lmax, node_min, ratio, lx, near_cut_step, lx_lowpass, lowpass_shape, notch :
         As for :func:`default_nodes` (``lx`` required here).
     nprobe : int
         Random probes of the other nodes.
@@ -788,7 +914,8 @@ def node_plan(
         Probes of the near-cut nodes, from ``round(0.95 lx)`` (the first
         dense node) to below ``2 lx`` (:data:`NEAR_CUT_PROBE_LIMIT`), and,
         with a low-pass, of the nodes from ``round(0.6 lx_lowpass)`` to below
-        ``2 lx_lowpass`` (:data:`LOWPASS_RANGE`).
+        ``2 lx_lowpass`` (:data:`LOWPASS_RANGE`), and, with a notch, of the
+        nodes from ``round(0.95 lx_lo)`` to below ``2 lx_hi``.
         ``None`` (the default): the complete basis of the degree, ``2 l' +
         1`` vectors, which makes the node's ratio exact.  A count at least
         ``2 l' + 1`` also gives the complete basis.
@@ -802,7 +929,10 @@ def node_plan(
         0 for the others.  The nodes below ``0.95 lx`` keep ``nprobe`` and no
         floor: the transfer function is near zero there and their bins are
         not usable anyway (:data:`FL_CUT`), while the complete basis and a
-        raised band-limit would cost as much as near the cut.
+        raised band-limit would cost as much as near the cut.  With a notch
+        the nodes from ``round(0.95 lx_lo)`` to below ``1.3 lx_hi`` get the
+        floor ``ceil(3.5 lx_hi)`` (its edges are sharp cuts, like the
+        high-pass), or the high-pass one if larger.
 
     Notes
     -----
@@ -847,6 +977,7 @@ def node_plan(
         near_cut_step=near_cut_step,
         lx_lowpass=lx_lowpass,
         lowpass_shape=lowpass_shape,
+        notch=notch,
     )
     nprobe = int(nprobe)
     if nprobe < 1:
@@ -864,15 +995,24 @@ def node_plan(
     if lx_lowpass is not None:
         lp_start = _round_half_up(LOWPASS_RANGE[0] * float(lx_lowpass))
         lp_stop = LOWPASS_RANGE[1] * float(lx_lowpass)
+    if notch is not None:
+        lx_lo, lx_hi = _check_notch(*notch)
+        notch_start = _round_half_up(NOTCH_RANGE[0] * lx_lo)
+        notch_floor = int(np.ceil(BANDLIMIT_FLOOR * lx_hi))
     for n in nodes:
         near = start <= n < NEAR_CUT_PROBE_LIMIT * lx
         if lp_start is not None:
             near = near or lp_start <= n < lp_stop
+        if notch is not None:
+            near = near or notch_start <= n < NOTCH_RANGE[1] * lx_hi
         if near:
             probes.append(2 * n + 1 if nprobe_near_cut is None else nprobe_near_cut)
         else:
             probes.append(nprobe)
-        floors.append(floor if start <= n < BANDLIMIT_NODE_LIMIT * lx else 0)
+        fl = floor if start <= n < BANDLIMIT_NODE_LIMIT * lx else 0
+        if notch is not None and notch_start <= n < BANDLIMIT_NODE_LIMIT * lx_hi:
+            fl = max(fl, notch_floor)
+        floors.append(fl)
     return NodePlan(nodes, probes, floors)
 
 
