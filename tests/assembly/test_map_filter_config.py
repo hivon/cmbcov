@@ -27,6 +27,7 @@ from cmbcov.config import CovarianceMatrixGenerator
 from cmbcov.config.validation import (
     LowpassConfig,
     MapFilterConfig,
+    NotchConfig,
     ParameterManager,
     ParameterValidator,
     PipelineConfig,
@@ -1423,10 +1424,13 @@ def test_lowpass_log_warnings(
         assert "geometric nodes alone" in nodes[0]
 
 
-def _real_run(workdir, lowpass, kernel_dir=None):
-    """A real (unfaked) lmax-20 run; the ratio file it saves."""
+def _real_run(workdir, lowpass, kernel_dir=None, **extra):
+    """A real (unfaked) lmax-20 run; the ratio file it saves.  ``extra``:
+    more keys of the ``map_filter`` block."""
     path = _params(str(workdir), polarised=True)
-    _edit_params(path, nprobe=7, **({} if lowpass is None else {"lowpass": lowpass}))
+    _edit_params(
+        path, nprobe=7, **({} if lowpass is None else {"lowpass": lowpass}), **extra
+    )
     if kernel_dir is not None:
         params = yaml.safe_load(open(path))
         params["cov_path"] = str(kernel_dir)  # the ratio cache lives there
@@ -1604,3 +1608,227 @@ def test_bin_transfer_minimum():
         (6, 7, 0.6),
     ]
     assert bin_transfer_minimum([0, 3], fl, lmin=5) == []
+
+
+# --------------------------------------------------------------------------- #
+# The time-frequency notch and the method of the white ratio
+# --------------------------------------------------------------------------- #
+#: A notch at 0.02-0.04 Hz scanned at 1 deg/s: azimuthal orders 7.2 to 14.4.
+NOTCH = {"f_lo": 0.02, "f_hi": 0.04, "v_az": 1.0}
+NOTCH_M = {"m_lo": 360 * 0.02, "m_hi": 360 * 0.04}
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        {"notch": None},
+        {"notch": NOTCH},
+        {"notch": {"f_lo": 0, "f_hi": 1.5, "v_az": 0.5}},
+        {"method": "map"},
+        {"method": "alm"},
+        {"notch": NOTCH, "lowpass": {"lx": 614}, "method": "alm"},
+    ],
+)
+def test_good_notch_and_method_blocks_validate(extra):
+    ok, errors = _validate({"type": "fourier_highpass", "lx": 30, **extra})
+    assert ok, errors
+
+
+@pytest.mark.parametrize(
+    "notch, fragment",
+    [
+        (1.0, "'map_filter.notch' must be null or a mapping"),
+        ({"f_hi": 1, "v_az": 1}, "'map_filter.notch.f_lo' is required"),
+        ({"f_lo": 1, "v_az": 1}, "'map_filter.notch.f_hi' is required"),
+        ({"f_lo": 1, "f_hi": 2}, "'map_filter.notch.v_az' is required"),
+        ({**NOTCH, "f_lo": -0.1}, "'map_filter.notch.f_lo' must be a finite"),
+        ({**NOTCH, "f_hi": float("inf")}, "'map_filter.notch.f_hi' must be a finite"),
+        ({**NOTCH, "v_az": 0}, "'map_filter.notch.v_az' must be a finite number > 0"),
+        ({**NOTCH, "v_az": "1"}, "'map_filter.notch.v_az' must be a finite"),
+        ({**NOTCH, "f_lo": True}, "'map_filter.notch.f_lo' must be a finite"),
+        ({**NOTCH, "f_hi": 0.02}, "'map_filter.notch.f_hi' (0.02) must exceed"),
+        ({**NOTCH, "f_hi": 0.01}, "must exceed"),
+        ({**NOTCH, "width": 1}, "Unknown key(s) ['width'] in 'map_filter.notch'"),
+    ],
+)
+def test_bad_notch_blocks_are_reported(notch, fragment):
+    ok, errors = _validate({"type": "fourier_highpass", "lx": 30, "notch": notch})
+    assert not ok
+    assert any(fragment in error for error in errors), errors
+
+
+@pytest.mark.parametrize("method", ["pix", None, 1])
+def test_bad_method_is_reported(method):
+    ok, errors = _validate({"type": "fourier_highpass", "lx": 30, "method": method})
+    assert not ok
+    assert any("'map_filter.method' must be one of" in e for e in errors), errors
+
+
+def test_notch_and_method_parsing():
+    base = {"type": "fourier_highpass", "lx": 30}
+    config = MapFilterConfig.from_block(base)
+    assert config.notch is None and config.method == "map"
+    assert MapFilterConfig.from_block({**base, "notch": None}) == config
+    config = MapFilterConfig.from_block({**base, "notch": NOTCH, "method": "alm"})
+    assert config.notch == NotchConfig(0.02, 0.04, 1.0)
+    assert config.method == "alm"
+    assert config.notch.as_dict() == NOTCH_M
+    # the identity records the orders: the same orders, the same entry
+    assert NotchConfig(0.04, 0.08, 2.0).as_dict() == NOTCH_M
+    assert {"notch", "method"} <= set(MapFilterConfig.KEYS)
+    params = dict(BASE, save_dir="x", git_hash="y")
+    block = {**base, "notch": NOTCH}
+    assert ParameterValidator().validate(dict(BASE, map_filter=block))
+    parsed = PipelineConfig.from_params(_effective(dict(params, map_filter=block)))
+    assert parsed.map_filter.notch == NotchConfig(**NOTCH)
+
+
+def test_changed_or_dropped_notch_or_method_is_incompatible(tmp_path):
+    block = {"type": "fourier_highpass", "lx": 30}
+    notched = dict(block, notch=dict(NOTCH))
+    manager = _manager(tmp_path, dict(BASE, map_filter=notched))
+    same = dict(block, notch=dict(NOTCH))
+    assert manager._incompatible_parameters(dict(BASE, map_filter=same)) == []
+    assert manager._incompatible_parameters(dict(BASE, map_filter=block)) == [
+        "map_filter"
+    ]
+    for change in ({"f_lo": 0.03}, {"f_hi": 0.05}, {"v_az": 2.0}):
+        other = dict(block, notch={**NOTCH, **change})
+        assert manager._incompatible_parameters(dict(BASE, map_filter=other)) == [
+            "map_filter"
+        ], change
+    assert manager._incompatible_parameters(
+        dict(BASE, map_filter=dict(notched, method="alm"))
+    ) == ["map_filter"]
+
+
+def test_generator_notch_reaches_the_plan_the_profile_and_the_identity(
+    tmp_path, fake_filtering
+):
+    """
+    ``map_filter.notch`` reaches the node plan and the combined profile in
+    azimuthal order, and adds a ``notch`` entry to the white and the
+    spectrum-aware identities; nothing else of the identity changes.
+    """
+    identities, profiles = [], []
+    for i, notch in enumerate((None, NOTCH)):
+        workdir = tmp_path / str(i)
+        workdir.mkdir()
+        path = _params(str(workdir))
+        if notch is not None:
+            _edit_params(path, notch=notch)
+        CovarianceMatrixGenerator(path).run_full_analysis()
+        identities.append(fake_filtering.calls["cache"][-1]["identity"])
+        profiles.append(fake_filtering.calls["probe"][-1]["profile"])
+    assert set(identities[0]) == OLD_IDENTITY_KEYS
+    assert "notch" not in fake_filtering.plan_calls[0]
+    assert probe_profile_is_highpass_only(fake_filtering, profiles[0], 12, "sharp", 6.0)
+
+    identity, profile = identities[1], profiles[1]
+    assert set(identity) == OLD_IDENTITY_KEYS | {"notch"}
+    assert identity["notch"] == NOTCH_M
+    # the plan gains the notch nodes (from round(0.95 m_lo) = 7); the rest
+    # of the identity is unchanged
+    plan_keys = {"notch", "nodes", "nprobe", "lmax_int_floor"}
+    assert 7 in identity["nodes"] and 7 not in identities[0]["nodes"]
+    assert {k: v for k, v in identity.items() if k not in plan_keys} == {
+        k: v for k, v in identities[0].items() if k not in plan_keys
+    }
+    assert fake_filtering.plan_calls[1]["notch"] == (NOTCH_M["m_lo"], NOTCH_M["m_hi"])
+    assert profile.func is fake_filtering.combined_profile
+    assert profile.keywords == {
+        "lx": 12,
+        "shape": "sharp",
+        "power": 6.0,
+        "lowpass": None,
+        "notch": NOTCH_M,
+    }
+    # with a low-pass too: both in the profile and the identity
+    workdir = tmp_path / "both"
+    workdir.mkdir()
+    path = _params(str(workdir))
+    _edit_params(path, notch=NOTCH, lowpass={"lx": 18}, spectrum_aware=True)
+    CovarianceMatrixGenerator(path).run_full_analysis()
+    sa_identity = fake_filtering.calls["cache"][-1]["identity"]
+    assert sa_identity["kind"] == "spectrum_aware_TT"
+    assert sa_identity["notch"] == NOTCH_M and "lowpass" in sa_identity
+    keywords = fake_filtering.sa_calls[-1]["profile"].keywords
+    assert keywords["notch"] == NOTCH_M and keywords["lowpass"]["lx"] == 18.0
+
+
+def test_generator_method_reaches_the_white_probes_only(tmp_path, fake_filtering):
+    """
+    ``method: map`` (the default) leaves the probing call and the identity as
+    they were without the key; ``method: alm`` reaches the white ratio and
+    its identity, and not the spectrum-aware ones (always probed).
+    """
+    runs = {}
+    for name, extra in (
+        ("absent", {}),
+        ("map", {"method": "map"}),
+        ("alm", {"method": "alm"}),
+    ):
+        workdir = tmp_path / name
+        workdir.mkdir()
+        path = _params(str(workdir), polarised=True)
+        if extra:
+            _edit_params(path, **extra)
+        CovarianceMatrixGenerator(path).run_full_analysis()
+        runs[name] = (
+            fake_filtering.calls["probe"][-1]["kwargs"],
+            fake_filtering.calls["cache"][-1]["identity"],
+        )
+    assert runs["map"] == runs["absent"]
+    assert "method" not in runs["absent"][0] and "method" not in runs["absent"][1]
+    kwargs, identity = runs["alm"]
+    assert kwargs["method"] == "alm"
+    assert identity == {**runs["absent"][1], "method": "alm"}
+
+    workdir = tmp_path / "sa"
+    workdir.mkdir()
+    path = _spectrum_aware_params(str(workdir), polarised=True)
+    _edit_params(path, method="alm")
+    CovarianceMatrixGenerator(path).run_full_analysis()
+    white, aware = fake_filtering.calls["cache"][-2:]
+    assert white["identity"]["method"] == "alm"
+    assert aware["identity"]["kind"] == "spectrum_aware_TT"
+    assert "method" not in aware["identity"]
+    assert "method" not in fake_filtering.sa_calls[-1]["kwargs"]
+
+
+def test_real_run_notch_and_alm_method(tmp_path):
+    """
+    End to end with the real probing: a notch far above the band changes no
+    ratio but has its own cache file; a notch inside the band adds its nodes
+    and changes the ratios at the nodes both runs share (same probes there).
+
+    The test mask is symmetric about the pole to round-off (1e-14 of its
+    power in m > 0, i.e. 1e-7 in amplitude), so ``method: alm`` runs, with
+    a cache file of its own, and gives the probes' complete basis (every node
+    here has ``2 l' + 1 <= 128``) to that level where the sums are not
+    round-off.
+    """
+    kernels = tmp_path / "kernels"
+    runs = {}
+    for name, extra in (
+        ("plain", {}),
+        ("huge", {"notch": {"f_lo": 1e4, "f_hi": 2e4, "v_az": 1.0}}),
+        ("band", {"notch": {"f_lo": 0.02, "f_hi": 0.04, "v_az": 1.0}}),  # M 7.2..14.4
+        ("alm", {"method": "alm"}),
+    ):
+        workdir = tmp_path / name
+        workdir.mkdir()
+        runs[name] = _real_run(workdir, None, kernels, **extra)[1]
+    assert len(os.listdir(kernels / "filtered_sum_rule")) == 4
+    plain, huge, band, alm = (runs[k] for k in ("plain", "huge", "band", "alm"))
+    assert 7 in band["nodes"] and 7 not in plain["nodes"]  # round(0.95 m_lo)
+    shared = np.isin(band["nodes"], plain["nodes"])
+    assert shared.sum() == plain["nodes"].size
+    assert np.all(2 * plain["nodes"] + 1 <= plain["nprobe"])  # complete basis
+    for ch in plain["channels"]:
+        assert np.array_equal(huge[f"g_{ch}"], plain[f"g_{ch}"]), ch
+        assert np.all(band[f"g_{ch}"] > 0)
+        assert not np.array_equal(band[f"g_{ch}"][shared], plain[f"g_{ch}"]), ch
+        np.testing.assert_allclose(
+            alm[f"g_{ch}"][:, :9], plain[f"g_{ch}"][:, :9], rtol=1e-6, atol=0
+        )

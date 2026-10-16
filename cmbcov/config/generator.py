@@ -658,6 +658,19 @@ class CovarianceMatrixGenerator:
                 "lowpass_shape": settings.lowpass.shape,
             }
         )
+        # Likewise the notch, in azimuthal order M = 360 f / v_az.
+        notch = None if settings.notch is None else settings.notch.as_dict()
+        if notch is not None:
+            low_args["notch"] = (notch["m_lo"], notch["m_hi"])
+            self.logger.info(
+                "map_filter: notch %s-%s Hz at %s deg/s removes the azimuthal "
+                "orders %.2f <= |M| <= %.2f",
+                settings.notch.f_lo,
+                settings.notch.f_hi,
+                settings.notch.v_az,
+                notch["m_lo"],
+                notch["m_hi"],
+            )
         plan = filtering.node_plan(
             lmax,
             settings.node_min,
@@ -671,7 +684,7 @@ class CovarianceMatrixGenerator:
         nodes = [int(n) for n in plan.nodes]
         nprobe = [int(n) for n in plan.nprobe]
         floors = [int(n) for n in plan.lmax_int_floor]
-        if settings.lowpass is None:
+        if settings.lowpass is None and notch is None:
             profile = functools.partial(
                 filtering.highpass_profile,
                 lx=settings.lx,
@@ -679,12 +692,16 @@ class CovarianceMatrixGenerator:
                 power=settings.power,
             )
         else:
+            extra = {} if notch is None else {"notch": notch}
             profile = functools.partial(
                 filtering.combined_profile,
                 lx=settings.lx,
                 shape=settings.shape,
                 power=settings.power,
-                lowpass=settings.lowpass.as_dict(),
+                lowpass=(
+                    None if settings.lowpass is None else settings.lowpass.as_dict()
+                ),
+                **extra,
             )
         identity = {
             "mask_digest": cov.wlm.mask_digest,
@@ -705,6 +722,12 @@ class CovarianceMatrixGenerator:
             # Only when present: the identity (hence the cache file name) of a
             # run without a low-pass is what it was before the key existed.
             identity["lowpass"] = settings.lowpass.as_dict()
+        if notch is not None:
+            identity["notch"] = notch
+        # the white ratio's method, only when not the default probes
+        white_identity = (
+            identity if settings.method == "map" else {**identity, "method": settings.method}
+        )
         mask_alm = []
 
         def get_mask_alm() -> np.ndarray:
@@ -727,6 +750,7 @@ class CovarianceMatrixGenerator:
                 "nodes": nodes,
                 "nprobe": nprobe,
                 "lmax_int_floor": floors,
+                **({} if notch is None else {"notch": notch}),
             }
         )
         cov.config.filter_rho = None
@@ -735,6 +759,7 @@ class CovarianceMatrixGenerator:
 
             def compute() -> dict[str, np.ndarray]:
                 computed.append(True)
+                method = {} if settings.method == "map" else {"method": settings.method}
                 return filtering.filtered_sum_rule_ratio(
                     get_mask_alm(),
                     lw,
@@ -746,15 +771,20 @@ class CovarianceMatrixGenerator:
                     seed=settings.seed,
                     lmax_int_floor=floors,
                     verbose=self.verbose_mode,
+                    **method,
                 )
 
             self.logger.info(
                 f"map_filter: channels {', '.join(channels)}, {len(nodes)} nodes "
                 f"({nodes[0]}..{nodes[-1]}), dmax={dmax}, lw={lw}, "
-                f"{self._probe_summary(nodes, nprobe, floors)}"
+                + (
+                    f"{self._probe_summary(nodes, nprobe, floors)}"
+                    if settings.method == "map"
+                    else f"method={settings.method} (exact, order by order)"
+                )
             )
             g = filtering.cached_sum_rule_ratio(
-                self.config.acc_kernel_dir, identity, compute
+                self.config.acc_kernel_dir, white_identity, compute
             )
             self.logger.info(
                 "map_filter: sum-rule ratio "

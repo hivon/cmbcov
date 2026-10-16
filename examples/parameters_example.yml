@@ -208,6 +208,16 @@ fl: null
 #     lx: 6144
 #     shape: exp          # or 'sharp': 1 where |M| <= lx sin(theta)
 #     power: 6            # 'exp' only: exp(-(|M| / (lx sin(theta)))^power)
+#   # Optional sharp notch of the time stream, [f_lo, f_hi] in Hz, for a scan
+#   # at the constant azimuthal rate dphi/dt = v_az (deg/s): it removes the
+#   # azimuthal orders 360 f_lo / v_az <= |M| <= 360 f_hi / v_az on every
+#   # ring. Absent (the default): no notch.
+#   notch:
+#     f_lo: 1.0
+#     f_hi: 1.2
+#     v_az: 1.0
+#   method: map           # 'alm': exact ratio, only for a mask symmetric
+#                         # about the scan axis (a reference, not production)
 # Transfer function 'hl'. Accepted and stored on the parsed config but not
 # currently read or applied anywhere in the pipeline.
 hl: null

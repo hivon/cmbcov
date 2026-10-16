@@ -394,6 +394,58 @@ noise) and the shift to 0.16%. The complete basis was not run: at the top node i
 is 7001 probes of 18 s each (3 channels, filtered and unfiltered, measured on
 a shared machine), about 35 hours.
 
+### The notch (`notch`)
+
+A notch of the time stream, $[f_{\mathrm{lo}}, f_{\mathrm{hi}}]$ in Hz (a
+pulse-tube line, say), is defined in time frequency, not in physical scale.
+For a scan at the constant azimuthal rate $d\phi/dt = v_{\mathrm{az}}$
+(deg/s, turnarounds and the sign changes ignored), the mode
+$e^{iM\phi}$ of a ring is swept at $f = M v_{\mathrm{az}} / 360$ whatever
+its colatitude, so the notch is the same azimuthal band on every ring:
+
+```math
+h_{\mathrm{notch}}(M) = \begin{cases} 0 & m_{\mathrm{lo}} \le \lvert M \rvert \le m_{\mathrm{hi}} \\ 1 & \text{otherwise} \end{cases}
+\qquad m = \frac{360 f}{v_{\mathrm{az}}} ,
+```
+
+with no $\sin\theta$, unlike the high-pass and the low-pass, whose cuts are
+physical scales $l_x$ seen at $m_c = l_x \sin\theta$. The filter of the run
+is the product $h = h_{\mathrm{high}}\thinspace h_{\mathrm{low}}\thinspace
+h_{\mathrm{notch}}$. A notch that holds no integer $M$ filters nothing.
+
+Because $h_{\mathrm{notch}}$ does not depend on $\theta$, the notch alone is
+diagonal in harmonic space: it zeroes the $a_{\ell m}$ with
+$m_{\mathrm{lo}} \le \lvert m \rvert \le m_{\mathrm{hi}}$, and scatters no
+power across multipoles (no band-limit floor). It still couples to the mask:
+$K K^\dagger = T P T$ with $T$ the mask coupling and $P$ the projector on
+the kept orders, and $T$ mixes orders through the azimuthal structure of
+the mask, so no closed form replaces the probes.
+
+A degree $\ell$ loses about the fraction
+$2(\min(\ell, m_{\mathrm{hi}}) - m_{\mathrm{lo}})/(2\ell+1)$ of its
+modes: none below $m_{\mathrm{lo}}$, a linear rise to a kink at
+$m_{\mathrm{hi}}$, then a $1/\ell$ decline. The node plan therefore adds
+nodes around both kinks (every edge/50 from 0.95 to 1.15 times the edge,
+every edge/15 from 0.95 to 2 times it), with the near-cut probe count. These
+densities are chosen by analogy with the sharp low-pass and the high-pass
+and have not yet been validated against exact rows.
+
+### Exact ratios for a symmetric mask (`method: alm`)
+
+For a mask symmetric about the scan axis, $W = W(\theta)$, every operator
+commutes with rotations about the axis and acts on each order $m$
+separately: $K^{(m)} = A_m D_m S_m$, with $S_m$ the Legendre synthesis of
+order $m$, $A_m$ its adjoint with the GL ring weights and $D_m$ the
+multiplication of ring $j$ by $W(\theta_j)\thinspace h(\theta_j, m)$. The
+complete-basis sums are then computed order by order, exactly, on the same
+grid and band-limit as the probes, at about $(\ell'+1)/\ell_{\mathrm{int}}$
+of the cost of one probe per channel operator; they equal the probes'
+complete basis to round-off (`tests/assembly/test_filtering.py`, Sect. 10),
+for any ring filter. Real masks are never symmetric, so this is a reference
+for checking the probes and the node plan (for instance the notch nodes), not
+a production method: the run stops with an error when the mask has more than
+$10^{-10}$ of its power in $m > 0$.
+
 ## 3. Assumptions and validity
 
 - **Scan frame.** The filter is diagonal in the azimuthal order around the

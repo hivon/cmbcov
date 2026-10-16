@@ -106,6 +106,10 @@ alone, with a warning.
 | `lowpass.lx` | float | required | Cut $m_c = l_x \sin\theta$ of the low-pass, the same convention as the high-pass `lx`. Finite, `> 0`, and above the high-pass `lx`. |
 | `lowpass.shape` | `exp` \| `sharp` | `exp` | `exp`: $h_{\mathrm{low}} = \exp[-(\lvert M \rvert / (l_x \sin\theta))^p]$; `sharp`: 1 where $\lvert M \rvert \le l_x \sin\theta$, else 0. The ratio of the `sharp` shape has off-diagonal structure at its kink that the (mean, distance) interpolation cannot carry: blocks within a few multipoles of `lx` are about 3-4% off even with the fine nodes, and the run logs a warning when `lx <= lmax`. The `exp` shape has no such limit. |
 | `lowpass.power` | float | 6 | Exponent $p$ of the `exp` shape; finite, `> 0`; unused by `sharp`. |
+| `notch` | mapping or null | null | A sharp notch of the time stream, $[f_{\mathrm{lo}}, f_{\mathrm{hi}}]$ in Hz, for a scan at the constant azimuthal rate $d\phi/dt = v_{\mathrm{az}}$ (turnarounds ignored). A time frequency is the same azimuthal order $M = 360 f / v_{\mathrm{az}}$ on every ring (no $\sin\theta$, unlike the physical-scale cuts `lx`): the notch sets $h = 0$ for $m_{\mathrm{lo}} \le \lvert M \rvert \le m_{\mathrm{hi}}$ and multiplies the rest of the filter. Absent or `null`: no notch, and the results and cache keys are exactly those of a file without the key. The node plan adds dense nodes around both edges (by analogy with the other cuts; not yet validated against exact rows). `fl` must include the notch; nothing checks it. See [`theory/filter_and_bin.md`](theory/filter_and_bin.md), "The notch". |
+| `notch.f_lo`, `notch.f_hi` | float | required | Edges of the notch in Hz, finite, `0 <= f_lo < f_hi`. |
+| `notch.v_az` | float | required | Azimuthal scan rate in deg/s, finite, `> 0`. |
+| `method` | `map` \| `alm` | `map` | How the white ratios are computed. `map`: the probes, for any mask. `alm`: exactly, order by order, which needs a mask symmetric about the scan axis (at most $10^{-10}$ of its power in $m > 0$; the run stops with an error otherwise): a reference for checking the probes and the nodes, not a production setting, since real masks are never $W(\theta)$ only. The spectrum-aware TT ratio is always probed. |
 | `dmax` | int or null | null | Largest $\lvert \ell_1 - \ell_2 \rvert$ probed, `>= 0`. `null`: the run's ACC `dmax - 1` with ACC, 64 otherwise, capped at `lmax - 1`. |
 | `lw` | int or null | null | Mask band-limit of the probes. `null`: `min(3 * nside - 1, 2 * lmax)`. |
 | `spectrum_aware` | bool | false | Probe every TT x TT block with the run's own spectra instead of the white `00` channel: the block is multiplied by its own ratio of filtered to unfiltered covariance, with no `fl` division. Needed for a sharp cut, which scatters low $\ell$ TT power to high $\ell$ (TT variance 5.5% low at $\ell$ = 2000-3500 otherwise). The other T/E blocks are unchanged. The ratio depends on the spectra: changing them probes again. |
@@ -122,8 +126,10 @@ those below 0.1: cut those.
 
 The probed ratios are cached in the kernel directory (`cov_path`), keyed on
 the mask, the channels, the nodes with their probe counts and band-limit
-floors, and every key above (the `lowpass` entry only when there is one, so
-the caches of files without it stay valid), so a rerun with the same filter
+floors, and every key above (the `lowpass` and `notch` entries only when
+there is one, the notch as its orders $m_{\mathrm{lo}}, m_{\mathrm{hi}}$, and
+`method` only when it is `alm`, so the caches of files without them stay
+valid), so a rerun with the same filter
 and blocks does not probe again; with `spectrum_aware` the TT x TT ratios
 are keyed on the blocks' Wick terms and a digest of the spectra as well, so
 a change of `cmb_spectrum`, `foregrounds`, `nl`, `beams`, `pixwin` or `fl`

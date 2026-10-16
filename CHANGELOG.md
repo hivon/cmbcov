@@ -1,5 +1,24 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- **`map_filter.notch`: a sharp time-frequency notch.** `notch: {f_lo,
+  f_hi, v_az}` removes the time-stream band `[f_lo, f_hi]` (Hz) of a scan at
+  the constant azimuthal rate `v_az` (deg/s), i.e. the azimuthal orders
+  `360 f_lo / v_az <= |M| <= 360 f_hi / v_az`, the same on every ring (no
+  `sin(theta)`, unlike `lx`). It multiplies the high-pass (and the
+  low-pass). `filtering.scan_m` and `filtering.notch_profile` are new;
+  `combined_profile` takes `notch={"m_lo", "m_hi"}`, and `default_nodes` and
+  `node_plan` take `notch=(m_lo, m_hi)` and add nodes around both edges.
+  Absent: results and cache keys unchanged.
+- **`map_filter.method`: `map` (default) or `alm`.** `alm` computes the white
+  ratios exactly, order by order, for a mask symmetric about the scan axis
+  (`filtered_sum_rule_ratio(..., method="alm")`); it equals the complete-basis
+  probes to round-off and serves as a reference. Any other mask stops the run
+  with an error. `map` leaves the cache keys unchanged.
+
 ## 0.8.0 — 2026-10-15
 
 ### Added

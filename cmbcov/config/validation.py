@@ -299,6 +299,52 @@ class LowpassConfig:
 
 
 @dataclass(frozen=True)
+class NotchConfig:
+    """
+    The optional ``map_filter.notch`` sub-block: a sharp notch of the time
+    stream, ``[f_lo, f_hi]`` in Hz, for a scan at the constant azimuthal
+    rate ``dphi/dt = v_az`` (deg/s, turnarounds ignored). A time frequency
+    ``f`` is the azimuthal order ``M = 360 f / v_az`` on every ring
+    (:func:`cmbcov.assembly.filtering.scan_m`), unlike the physical-scale
+    cuts ``lx`` of the high-pass and the low-pass (``lx sin(theta)``); the
+    notch removes ``m_lo <= |M| <= m_hi``
+    (:func:`cmbcov.assembly.filtering.notch_profile`) and multiplies the
+    rest of the filter.
+
+    Attributes
+    ----------
+    f_lo, f_hi : float
+        Edges of the notch in Hz, finite, ``0 <= f_lo < f_hi``.
+    v_az : float
+        Azimuthal scan rate in deg/s, finite, ``> 0``.
+    """
+
+    f_lo: float
+    f_hi: float
+    v_az: float
+
+    #: Keys of the sub-block (all required).
+    KEYS = ("f_lo", "f_hi", "v_az")
+
+    @classmethod
+    def from_block(cls, block: Mapping[str, Any]) -> "NotchConfig":
+        """Build from an already validated sub-block."""
+        return cls(f_lo=block["f_lo"], f_hi=block["f_hi"], v_az=block["v_az"])
+
+    def as_dict(self) -> dict[str, float]:
+        """``{"m_lo", "m_hi"}``, the notch in azimuthal order: the form
+        :func:`cmbcov.assembly.filtering.combined_profile` takes and the cache
+        identity records (so two files with the same orders share the cache,
+        whatever their ``f`` and ``v_az``)."""
+        from ..assembly.filtering import scan_m
+
+        return {
+            "m_lo": scan_m(self.f_lo, self.v_az),
+            "m_hi": scan_m(self.f_hi, self.v_az),
+        }
+
+
+@dataclass(frozen=True)
 class MapFilterConfig:
     """
     The ``map_filter`` block of a parameter file: the optional filter-and-bin
@@ -373,6 +419,20 @@ class MapFilterConfig:
         has off-diagonal structure at the kink that the (mean, distance)
         interpolation cannot carry, so blocks within a few multipoles of
         ``lx`` are about 3-4% off; the exp shape has no such limit.
+    notch : NotchConfig, optional
+        A sharp time-frequency notch multiplying the rest of the filter
+        (``h = h_highpass h_lowpass h_notch``), at the same azimuthal order
+        on every ring. ``None`` (the sub-block absent or ``null``): no notch,
+        and every result and cache key is that of a file without the key.
+        ``fl`` must include the notch (nothing checks it).
+    method : {"map", "alm"}, default "map"
+        How the white sum-rule ratio is computed
+        (:func:`cmbcov.assembly.filtering.filtered_sum_rule_ratio`):
+        ``map``, the probes, for any mask; ``alm``, exactly, order by order,
+        which needs a mask symmetric about the scan axis (the run stops with
+        an error otherwise), a reference rather than a production setting.
+        The spectrum-aware TT ratio is always probed. ``map`` leaves the
+        cache key as it was without the key.
     """
 
     type: str
@@ -389,6 +449,8 @@ class MapFilterConfig:
     near_cut_step: float | None = None
     nprobe_near_cut: int | None = 128
     lowpass: LowpassConfig | None = None
+    notch: NotchConfig | None = None
+    method: str = "map"
 
     #: Keys accepted in the block.
     KEYS = (
@@ -406,11 +468,15 @@ class MapFilterConfig:
         "near_cut_step",
         "nprobe_near_cut",
         "lowpass",
+        "notch",
+        "method",
     )
     #: Accepted values of ``type``.
     TYPES = ("fourier_highpass",)
     #: Accepted values of ``shape``.
     SHAPES = ("sharp", "exp")
+    #: Accepted values of ``method``.
+    METHODS = ("map", "alm")
     #: Default ``dmax`` for the methods without an ACC ``dmax``.
     DEFAULT_DMAX = 64
 
@@ -440,6 +506,12 @@ class MapFilterConfig:
                 if block.get("lowpass") is None
                 else LowpassConfig.from_block(block["lowpass"])
             ),
+            notch=(
+                None
+                if block.get("notch") is None
+                else NotchConfig.from_block(block["notch"])
+            ),
+            method=block.get("method", "map"),
         )
 
     def resolved_dmax(self, lmax: int, method: CovarianceMethod, acc_dmax: int) -> int:
@@ -1126,7 +1198,10 @@ class ParameterValidator:
         null or a number >= 0; ``nprobe_near_cut`` not null or an integer
         >= 1; ``lowpass`` not null or a mapping of :class:`LowpassConfig`
         keys with ``lx`` a finite number above ``lx`` of the block, ``shape``
-        ``exp`` or ``sharp``, ``power`` a finite positive number.
+        ``exp`` or ``sharp``, ``power`` a finite positive number; ``notch``
+        not null or a mapping of the three :class:`NotchConfig` keys with
+        finite ``0 <= f_lo < f_hi`` and ``v_az > 0``; ``method`` not ``map``
+        or ``alm``.
 
         A run with B-mode blocks is not refused: the correction covers the
         T/E blocks only and the run warns that the blocks with a B leg are
@@ -1230,6 +1305,60 @@ class ParameterValidator:
             )
 
         self._check_lowpass(block, where)
+        self._check_notch(block, where)
+
+        method = block.get("method", "map")
+        if method not in MapFilterConfig.METHODS:
+            self.errors.append(
+                f"'{where}.method' must be one of {list(MapFilterConfig.METHODS)}, "
+                f"got {method!r}"
+            )
+
+    def _check_notch(self, block: dict[str, Any], where: str) -> None:
+        """Validate the optional ``notch`` sub-block of ``block``
+        (:class:`NotchConfig`); ``where`` names the parent block."""
+        notch = block.get("notch")
+        if notch is None:
+            return
+        where = f"{where}.notch"
+        if not isinstance(notch, dict):
+            self.errors.append(
+                f"'{where}' must be null or a mapping of "
+                f"{list(NotchConfig.KEYS)}, got {type(notch).__name__}"
+            )
+            return
+        unknown = sorted(set(notch) - set(NotchConfig.KEYS))
+        if unknown:
+            self.errors.append(
+                f"Unknown key(s) {unknown} in '{where}'; expected "
+                f"{list(NotchConfig.KEYS)}"
+            )
+        values = {}
+        for key, what in (
+            ("f_lo", "the lower edge, Hz"),
+            ("f_hi", "the upper edge, Hz"),
+            ("v_az", "the azimuthal scan rate, deg/s"),
+        ):
+            if key not in notch:
+                self.errors.append(f"'{where}.{key}' is required ({what})")
+                continue
+            value = notch[key]
+            bound = "> 0" if key == "v_az" else ">= 0"
+            if (
+                not _is_number(value)
+                or not math.isfinite(value)
+                or not (value > 0 if key == "v_az" else value >= 0)
+            ):
+                self.errors.append(
+                    f"'{where}.{key}' must be a finite number {bound}, got {value!r}"
+                )
+            else:
+                values[key] = value
+        if "f_lo" in values and "f_hi" in values and not values["f_hi"] > values["f_lo"]:
+            self.errors.append(
+                f"'{where}.f_hi' ({values['f_hi']!r}) must exceed "
+                f"'{where}.f_lo' ({values['f_lo']!r})"
+            )
 
     def _check_lowpass(self, block: dict[str, Any], where: str) -> None:
         """Validate the optional ``lowpass`` sub-block of ``block``
