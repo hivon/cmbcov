@@ -46,6 +46,7 @@ __all__ = ["SpectraLoader", "detect_parity_odd_nonzero", "stokes_columns"]
 SPECTRUM_FILE_LAYOUTS = {
     1: ("TT",),
     4: ("TT", "EE", "BB", "TE"),
+    9: ("TT", "EE", "BB", "TE", "TB", "EB"),
     9: ("TT", "EE", "BB", "TE", "TB", "EB", "ET", "BT", "BE"),
 }
 
