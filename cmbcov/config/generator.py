@@ -726,7 +726,9 @@ class CovarianceMatrixGenerator:
             identity["notch"] = notch
         # the white ratio's method, only when not the default probes
         white_identity = (
-            identity if settings.method == "map" else {**identity, "method": settings.method}
+            identity
+            if settings.method == "map"
+            else {**identity, "method": settings.method}
         )
         mask_alm = []
 

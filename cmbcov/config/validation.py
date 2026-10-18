@@ -1354,7 +1354,11 @@ class ParameterValidator:
                 )
             else:
                 values[key] = value
-        if "f_lo" in values and "f_hi" in values and not values["f_hi"] > values["f_lo"]:
+        if (
+            "f_lo" in values
+            and "f_hi" in values
+            and not values["f_hi"] > values["f_lo"]
+        ):
             self.errors.append(
                 f"'{where}.f_hi' ({values['f_hi']!r}) must exceed "
                 f"'{where}.f_lo' ({values['f_lo']!r})"

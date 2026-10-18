@@ -2007,7 +2007,9 @@ def test_combined_profile_with_notch():
     lg = 40
     notch = {"m_lo": 12, "m_hi": 18}
     h = combined_profile(lg, 5.0, "sharp", 6.0, notch=notch)
-    np.testing.assert_array_equal(h, highpass_profile(lg, 5.0) * notch_profile(lg, 12, 18))
+    np.testing.assert_array_equal(
+        h, highpass_profile(lg, 5.0) * notch_profile(lg, 12, 18)
+    )
     low = {"lx": 30.0}
     np.testing.assert_array_equal(
         combined_profile(lg, 5.0, "exp", 4.0, low, notch),
@@ -2023,29 +2025,40 @@ def test_combined_profile_with_notch():
 
 
 def test_nodes_through_a_notch():
-    from cmbcov.assembly.filtering import node_plan
+    """Geometric nodes a factor 1.03 apart from round(0.95 m_lo) to the last
+    node, none inside the high-pass dense range, no geometric node crowding
+    them, and the ordinary probe count (no near-cut count, no floor)."""
+    from cmbcov.assembly.filtering import NOTCH_RATIO, node_plan
 
     base = default_nodes(1001, lx=100)
     assert default_nodes(1001, lx=100, notch=None) == base
     assert default_nodes(1001, lx=100, near_cut_step=0, notch=(300, 400)) == (
         default_nodes(1001)
     )
-    for notch in [(300, 400), (300, 310), (0, 50)]:
-        nodes = default_nodes(1001, lx=100, notch=notch)
-        assert nodes == sorted(set(nodes)) and nodes[-1] == 1000
-        assert set(nodes) > set(n for n in base if n < 0.95 * max(notch[0], 1))
-    nodes = default_nodes(1001, lx=100, notch=(300, 400))
-    near = [n for n in nodes if 285 <= n <= 800]
-    assert min(np.diff(near)) >= 5  # fine and coarse stretches do not crowd
-    assert any(285 <= n <= 345 for n in nodes)  # fine nodes at both kinks
-    assert any(380 <= n <= 460 for n in nodes)
     with pytest.raises(ValueError, match="notch needs lx"):
         default_nodes(1001, notch=(300, 400))
 
+    nodes = default_nodes(1001, lx=100, notch=(300, 400))
+    assert nodes == sorted(set(nodes)) and nodes[-1] == 1000
+    above = np.array([n for n in nodes if n >= 285])
+    assert above[0] == 285  # round(0.95 m_lo)
+    steps = above[1:] / above[:-1]
+    assert steps.max() <= NOTCH_RATIO + 0.01  # no gap wider than the ratio
+    assert np.diff(above).min() >= 0.5 * (NOTCH_RATIO - 1) * 285  # no crowding
+    # the notch nodes do not depend on m_hi, and stay out of the dense
+    # high-pass range (95 to 200 here, every 7)
+    assert default_nodes(1001, lx=100, notch=(300, 310)) == nodes
+    low = default_nodes(1001, lx=100, notch=(120, 140))
+    assert [n for n in low if 95 <= n <= 200] == [n for n in base if 95 <= n <= 200]
+    # a notch at low order: consecutive nodes until the ratio exceeds 1
+    tiny = default_nodes(1001, lx=100, notch=(0, 50))
+    assert tiny[:5] == [1, 2, 3, 4, 5] and tiny[-1] == 1000
+
     assert node_plan(1001, 32, 1.25, 100) == node_plan(1001, 32, 1.25, 100, notch=None)
     plan = node_plan(1001, 32, 1.25, 100, nprobe_near_cut=128, notch=(300, 400))
+    assert plan.nodes == nodes
     for n, probes, floor in zip(*plan):
-        assert probes == (128 if 95 <= n < 200 or 285 <= n < 800 else 32)
+        assert probes == (128 if 95 <= n < 200 else 32)  # notch nodes: nprobe
         assert floor == (350 if 95 <= n < 130 else 0)  # the notch adds no floor
 
 
@@ -2053,9 +2066,7 @@ def test_nodes_through_a_notch():
 #: low-pass) and theta-independent (notch), alone and multiplied.
 _ALM_PROFILES = {
     "highpass": functools.partial(highpass_profile, lx=15.0, shape="sharp"),
-    "notch": functools.partial(
-        combined_profile, lx=0.0, notch={"m_lo": 8, "m_hi": 14}
-    ),
+    "notch": functools.partial(combined_profile, lx=0.0, notch={"m_lo": 8, "m_hi": 14}),
     "highpass_notch": functools.partial(
         combined_profile, lx=10.0, notch={"m_lo": 18, "m_hi": 24}
     ),

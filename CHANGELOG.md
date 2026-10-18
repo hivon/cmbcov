@@ -11,7 +11,9 @@
   `sin(theta)`, unlike `lx`). It multiplies the high-pass (and the
   low-pass). `filtering.scan_m` and `filtering.notch_profile` are new;
   `combined_profile` takes `notch={"m_lo", "m_hi"}`, and `default_nodes` and
-  `node_plan` take `notch=(m_lo, m_hi)` and add nodes around both edges.
+  `node_plan` take `notch=(m_lo, m_hi)` and add geometric nodes a factor 1.03
+  apart from `0.95 m_lo` to `lmax`, with the ordinary `nprobe` (measured
+  against exact rows: `examples/notch_node_study.py`).
   Absent: results and cache keys unchanged.
 - **`map_filter.method`: `map` (default) or `alm`.** `alm` computes the white
   ratios exactly, order by order, for a mask symmetric about the scan axis

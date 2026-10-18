@@ -610,14 +610,15 @@ LOWPASS_DIVISOR = 15
 #: ``lx_lowpass`` are spaced ``lx_lowpass / LOWPASS_ONSET_DIVISOR`` apart.
 LOWPASS_ONSET_RANGE = (0.95, 1.15)
 LOWPASS_ONSET_DIVISOR = 50
-#: A notch ``[m_lo, m_hi]`` (:func:`notch_profile`) removes from degree
-#: ``l`` about the fraction ``2 (min(l, m_hi) - m_lo) / (2 l + 1)`` of its
-#: modes: none below ``m_lo``, rising linearly to a kink at ``m_hi``, then
-#: falling as ``1 / l``.  Around each kink the nodes are spaced ``edge /
-#: LOWPASS_ONSET_DIVISOR`` over :data:`LOWPASS_ONSET_RANGE`, and ``edge /
-#: NEAR_CUT_DIVISOR`` over ``NOTCH_RANGE`` (both in units of the edge).
-#: By analogy with the other filters; not validated against exact rows.
-NOTCH_RANGE = (0.95, 2.0)
+#: Nodes of a notch ``[m_lo, m_hi]`` (:func:`notch_profile`): geometric,
+#: a factor ``NOTCH_RATIO`` apart, from ``round(NOTCH_START m_lo)`` to the
+#: last node (:func:`default_nodes`, Notes).  A mode of order ``m`` lives
+#: where ``sin(theta) >= m / l``, so the notch changes :math:`\rho` from
+#: about ``m_lo / sin(theta_max)`` of the mask to beyond ``m_hi /
+#: sin(theta_min)``: the mask's latitude range, not the notch width, sets
+#: where, and the nodes cover every degree it can reach.
+NOTCH_START = 0.95
+NOTCH_RATIO = 1.03
 
 
 def _check_lowpass_cut(lx: float, lx_lowpass: float, shape: str) -> float:
@@ -647,44 +648,19 @@ def _round_half_up(x: float) -> int:
     return int(np.floor(x + 0.5))
 
 
-def _notch_groups(m_lo: float, m_hi: float, last: int) -> list:
-    """The ``(dense nodes, step)`` groups of a notch (:data:`NOTCH_RANGE`):
-    at each edge (``m_lo`` taken as at least 1) coarse nodes, replaced by
-    the fine ones around the kink in their stretch (and within half a coarse
-    step of it); the coarse nodes of
-    ``m_lo`` stop where those of ``m_hi`` start, and fine stretches that
-    overlap are merged.  Nodes outside ``1 .. last`` dropped."""
-
-    def dense(scale, a, b, divisor):
-        step = max(1, _round_half_up(scale / divisor))
-        nodes = range(
-            _round_half_up(a * scale), int(np.floor(b * scale + 1e-9)) + 1, step
-        )
-        return [n for n in nodes if 1 <= n <= last], step
-
-    lo = max(m_lo, 1.0)
-    coarse_lo, step_lo = dense(lo, *NOTCH_RANGE, NEAR_CUT_DIVISOR)
-    coarse_hi, step_hi = dense(m_hi, *NOTCH_RANGE, NEAR_CUT_DIVISOR)
-    fines = [
-        dense(lo, *LOWPASS_ONSET_RANGE, LOWPASS_ONSET_DIVISOR),
-        dense(m_hi, *LOWPASS_ONSET_RANGE, LOWPASS_ONSET_DIVISOR),
-    ]
-    fines = [f for f in fines if f[0]]
-    if len(fines) == 2 and fines[1][0][0] <= fines[0][0][-1]:
-        (f0, s0), (f1, _) = fines
-        merged = [n for n in range(f0[0], f1[-1] + 1, s0) if n <= last]
-        fines = [(merged, s0)]
-    if coarse_hi:
-        coarse_lo = [n for n in coarse_lo if n < coarse_hi[0]]
-    for fine, _ in fines:
-        coarse_lo = [
-            n for n in coarse_lo if not fine[0] - step_lo / 2 < n < fine[-1] + step_lo / 2
-        ]
-        coarse_hi = [
-            n for n in coarse_hi if not fine[0] - step_hi / 2 < n < fine[-1] + step_hi / 2
-        ]
-    groups = [(coarse_lo, step_lo), (coarse_hi, step_hi), *fines]
-    return [g for g in groups if g[0]]
+def _notch_nodes(m_lo: float, last: int, groups: list) -> list[int]:
+    """The nodes of a notch (:data:`NOTCH_START`, :data:`NOTCH_RATIO`):
+    ``n_0 = round(0.95 m_lo)`` (at least 1), ``n_{k+1} = max(round(1.03
+    n_k), n_k + 1)`` up to ``last``, without those inside the span of
+    another range of dense nodes (``groups``, ``(nodes, step)`` pairs),
+    which already sample it more finely."""
+    out = []
+    n = max(1, _round_half_up(NOTCH_START * m_lo))
+    while n <= last:
+        if all(not (d[0] <= n <= d[-1]) for d, _ in groups):
+            out.append(n)
+        n = max(_round_half_up(NOTCH_RATIO * n), n + 1)
+    return out
 
 
 def default_nodes(
@@ -734,10 +710,12 @@ def default_nodes(
         onset.
     notch : (float, float), optional
         Edges ``(m_lo, m_hi)``, in azimuthal order, of a time-frequency
-        notch (:func:`notch_profile`); needs ``lx``.  ``None`` (the default): no notch nodes, and the list
-        is exactly the one without this argument.  Otherwise the nodes of
-        :data:`NOTCH_RANGE` around both edges are added, the geometric nodes
-        dropped by the same rule as for the cut.
+        notch (:func:`notch_profile`); needs ``lx``.  ``None`` (the
+        default): no notch nodes, and the list is exactly the one without
+        this argument.  Otherwise geometric nodes a factor 1.03 apart from
+        ``round(0.95 m_lo)`` to ``lmax - 1`` are added (:func:`_notch_nodes`;
+        none inside the other dense ranges), and a geometric node closer to
+        one of them than half the local spacing, ``0.015 l``, is dropped.
 
     Returns
     -------
@@ -798,6 +776,25 @@ def default_nodes(
     ``lmax`` 3500) adds no node, which a survey-scale check supports (its
     shift of :math:`\rho` by 0.2 to 5%, :math:`\propto (\ell/\ell_x^{low})^6`,
     was interpolated between nodes a factor 1.25 apart to 0.16%).
+
+    **Notch nodes.**  Measured with exact rows (``method="alm"``) of a band
+    mask symmetric about the pole (colatitude 20-80 deg with the
+    apodisation, band-limit 256, coupling width 19), ``lmax`` 3500,
+    ``dmax`` 99, sharp high-pass 300, notch 4.03-4.09 Hz at 1 deg/s
+    (``M`` 1450.8-1472.4; ``examples/notch_node_study.py``).  The notch
+    left :math:`\rho` unchanged up to ``l' = 1550``, then lowered it by up
+    to 2.4% (``l'`` 2250) and still 0.6% at 3499: it acts from ``m_lo /
+    sin(theta_max)`` of the mask on, over a range set by the mask's
+    latitudes, not near the notch alone.  PCHIP through the exact values at
+    the nodes, against every other exact row from 1100 up: the geometric
+    nodes alone 0.85% off at ``d = 0`` (2.9% for ``d <= 19``); nodes a
+    factor 1.05 apart from ``0.95 m_lo`` 0.14% (1.1%), 1.03 apart 0.02%
+    (0.5%); a first plan of nodes concentrated at the two edges (to ``2
+    m_hi``) 0.06% (1.7%, beyond its last node) at 2.3 times the cost.  The
+    notch nodes take ``nprobe``: :math:`\rho` stays near 0.9 there, and 32
+    random probes were 0.11-0.15% off at ``d = 0`` (0.4-0.6% for ``d <=
+    19``), 128 probes 0.03-0.07% (0.3%); the near-cut count pays off only
+    where few modes survive.
     """
     lmax = int(lmax)
     node_min = int(node_min)
@@ -874,7 +871,9 @@ def default_nodes(
             )
         groups.extend(lp_groups)
     if notch is not None:
-        groups.extend(_notch_groups(*notch, last))
+        notch_nodes = _notch_nodes(notch[0], last, groups)
+        if notch_nodes:
+            groups.append((notch_nodes, None))  # None: the local spacing
     if not groups:
         return nodes
     kept = [
@@ -882,7 +881,9 @@ def default_nodes(
         for n in nodes
         if n == last
         or all(
-            not (d[0] <= n <= d[-1]) or np.abs(np.array(d) - n).min() >= 0.5 * st
+            not (d[0] <= n <= d[-1])
+            or np.abs(np.array(d) - n).min()
+            >= 0.5 * (st if st is not None else (NOTCH_RATIO - 1) * n)
             for d, st in groups
         )
     ]
@@ -928,8 +929,8 @@ def node_plan(
         Probes of the near-cut nodes, from ``round(0.95 lx)`` (the first
         dense node) to below ``2 lx`` (:data:`NEAR_CUT_PROBE_LIMIT`), and,
         with a low-pass, of the nodes from ``round(0.6 lx_lowpass)`` to below
-        ``2 lx_lowpass`` (:data:`LOWPASS_RANGE`), and, with a notch, of the
-        nodes from ``round(0.95 max(m_lo, 1))`` to below ``2 m_hi``.
+        ``2 lx_lowpass`` (:data:`LOWPASS_RANGE`).  The notch nodes take
+        ``nprobe`` (:func:`default_nodes`, Notes).
         ``None`` (the default): the complete basis of the degree, ``2 l' +
         1`` vectors, which makes the node's ratio exact.  A count at least
         ``2 l' + 1`` also gives the complete basis.
@@ -1008,15 +1009,10 @@ def node_plan(
     if lx_lowpass is not None:
         lp_start = _round_half_up(LOWPASS_RANGE[0] * float(lx_lowpass))
         lp_stop = LOWPASS_RANGE[1] * float(lx_lowpass)
-    if notch is not None:
-        m_lo, m_hi = _check_notch(*notch)
-        notch_start = _round_half_up(NOTCH_RANGE[0] * max(m_lo, 1.0))
     for n in nodes:
         near = start <= n < NEAR_CUT_PROBE_LIMIT * lx
         if lp_start is not None:
             near = near or lp_start <= n < lp_stop
-        if notch is not None:
-            near = near or notch_start <= n < NOTCH_RANGE[1] * m_hi
         if near:
             probes.append(2 * n + 1 if nprobe_near_cut is None else nprobe_near_cut)
         else:
@@ -1268,40 +1264,37 @@ def _node_sums_alm(
     nt = _nthreads(nthreads, lg)
     ones = np.ones_like(h[:, 0])
 
-    for m in range(ellp + 1):
+    mstart = np.zeros(1, dtype=np.int64)
+
+    def op(alm, m, spin, ring):
+        # A_m D_m S_m on the order-m coefficients alm (ncomp, size)
         mval = np.array([m], dtype=np.int64)
-        mstart = np.zeros(1, dtype=np.int64)
+        transform = {"lmax": lmax_int, "theta": theta, "spin": spin, "mval": mval}
+        leg = ducc0.sht.alm2leg(alm=alm, mstart=mstart, nthreads=nt, **transform)
+        leg *= (wbar * w_ring * ring)[None, :, None]
+        # leg2alm writes only l >= m: the rest must start at zero
+        out = np.zeros_like(alm)
+        return ducc0.sht.leg2alm(
+            leg=leg, mstart=mstart, nthreads=nt, alm=out, **transform
+        )
 
-        def op(alm, spin, ring):
-            # A_m D_m S_m on the order-m coefficients alm (ncomp, size)
-            leg = ducc0.sht.alm2leg(
-                alm=alm, lmax=lmax_int, theta=theta, spin=spin,
-                mval=mval, mstart=mstart, nthreads=nt,
-            )
-            leg *= (wbar * w_ring * ring)[None, :, None]
-            # leg2alm writes only l >= m: the rest must start at zero
-            out = np.zeros_like(alm)
-            return ducc0.sht.leg2alm(
-                leg=leg, lmax=lmax_int, theta=theta, spin=spin,
-                mval=mval, mstart=mstart, nthreads=nt, alm=out,
-            )
-
+    for m in range(ellp + 1):
         weight = 1.0 if m == 0 else 2.0
         z = np.zeros((1, size), dtype=complex)
         z[0, ellp] = 1.0
         for index, ring in ((0, h[:, m]), (1, ones)):
             if spin0:
-                y = op(op(z, 0, ring), 0, ring)[0]
+                y = op(op(z, m, 0, ring), m, 0, ring)[0]
                 sums["00"][index][:] += weight * np.abs(y) ** 2
             if spin2:
                 z2 = np.concatenate([z, np.zeros_like(z)])
-                u = op(z2, 2, ring)[0][None, :]  # [K_2^dagger (z, 0)]_E
+                u = op(z2, m, 2, ring)[0][None, :]  # [K_2^dagger (z, 0)]_E
                 if "20" in channels:
-                    y = op(u, 0, ring)[0]
+                    y = op(u, m, 0, ring)[0]
                     sums["20"][index][:] += weight * np.abs(y) ** 2
                 if "EE" in channels:
                     u2 = np.concatenate([u, np.zeros_like(u)])
-                    y = op(u2, 2, ring)[0]
+                    y = op(u2, m, 2, ring)[0]
                     sums["EE"][index][:] += weight * np.abs(y) ** 2
     return True, 2 * ellp + 1, sums
 
