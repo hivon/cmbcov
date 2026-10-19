@@ -2025,29 +2025,48 @@ def test_combined_profile_with_notch():
 
 
 def test_nodes_through_a_notch():
-    """Geometric nodes a factor 1.03 apart from round(0.95 m_lo) to the last
-    node, none inside the high-pass dense range, no geometric node crowding
-    them, and the ordinary probe count (no near-cut count, no floor)."""
-    from cmbcov.assembly.filtering import NOTCH_RATIO, node_plan
+    """Nodes graded about the onset l_on = m_lo / notch_sin_max: a factor
+    1.03 apart from round(0.95 l_on) to 1.25 l_on, 1.08 apart above, none
+    inside the high-pass dense range, no geometric node crowding them, and
+    the ordinary probe count (no near-cut count, no floor)."""
+    from cmbcov.assembly.filtering import (
+        NOTCH_RATIO_COARSE,
+        NOTCH_RATIO_FINE,
+        node_plan,
+    )
 
     base = default_nodes(1001, lx=100)
     assert default_nodes(1001, lx=100, notch=None) == base
+    assert default_nodes(1001, lx=100, notch=None, notch_sin_max=0.5) == base
     assert default_nodes(1001, lx=100, near_cut_step=0, notch=(300, 400)) == (
         default_nodes(1001)
     )
     with pytest.raises(ValueError, match="notch needs lx"):
         default_nodes(1001, notch=(300, 400))
+    for bad in (0.0, -0.5, 1.5):
+        with pytest.raises(ValueError, match="notch_sin_max"):
+            default_nodes(1001, lx=100, notch=(300, 400), notch_sin_max=bad)
 
-    nodes = default_nodes(1001, lx=100, notch=(300, 400))
-    assert nodes == sorted(set(nodes)) and nodes[-1] == 1000
-    above = np.array([n for n in nodes if n >= 285])
-    assert above[0] == 285  # round(0.95 m_lo)
-    steps = above[1:] / above[:-1]
-    assert steps.max() <= NOTCH_RATIO + 0.01  # no gap wider than the ratio
-    assert np.diff(above).min() >= 0.5 * (NOTCH_RATIO - 1) * 285  # no crowding
-    # the notch nodes do not depend on m_hi, and stay out of the dense
-    # high-pass range (95 to 200 here, every 7)
-    assert default_nodes(1001, lx=100, notch=(300, 310)) == nodes
+    for sin_max in (1.0, 0.75):
+        onset = 300 / sin_max
+        nodes = default_nodes(1001, lx=100, notch=(300, 400), notch_sin_max=sin_max)
+        assert nodes == sorted(set(nodes)) and nodes[-1] == 1000
+        above = np.array([n for n in nodes if n >= round(0.95 * onset)])
+        assert above[0] == round(0.95 * onset)
+        steps = above[1:] / above[:-1]
+        fine = above[1:] <= 1.25 * onset
+        assert steps[fine].max() <= NOTCH_RATIO_FINE + 0.01
+        assert steps[~fine].max() <= NOTCH_RATIO_COARSE + 0.01
+        assert np.diff(above).min() >= 0.5 * (NOTCH_RATIO_FINE - 1) * above[0]
+        # nothing added below the onset
+        assert [n for n in nodes if n < 0.95 * onset] == [
+            n for n in base if n < 0.95 * onset
+        ]
+    # the nodes do not depend on m_hi, and stay out of the dense high-pass
+    # range (95 to 200 here, every 7)
+    assert default_nodes(1001, lx=100, notch=(300, 310)) == default_nodes(
+        1001, lx=100, notch=(300, 400)
+    )
     low = default_nodes(1001, lx=100, notch=(120, 140))
     assert [n for n in low if 95 <= n <= 200] == [n for n in base if 95 <= n <= 200]
     # a notch at low order: consecutive nodes until the ratio exceeds 1
@@ -2055,11 +2074,34 @@ def test_nodes_through_a_notch():
     assert tiny[:5] == [1, 2, 3, 4, 5] and tiny[-1] == 1000
 
     assert node_plan(1001, 32, 1.25, 100) == node_plan(1001, 32, 1.25, 100, notch=None)
-    plan = node_plan(1001, 32, 1.25, 100, nprobe_near_cut=128, notch=(300, 400))
-    assert plan.nodes == nodes
+    plan = node_plan(
+        1001, 32, 1.25, 100, nprobe_near_cut=128, notch=(300, 400), notch_sin_max=0.75
+    )
+    assert plan.nodes == default_nodes(
+        1001, lx=100, notch=(300, 400), notch_sin_max=0.75
+    )
     for n, probes, floor in zip(*plan):
         assert probes == (128 if 95 <= n < 200 else 32)  # notch nodes: nprobe
         assert floor == (350 if 95 <= n < 130 else 0)  # the notch adds no floor
+
+
+def test_mask_sin_theta_max():
+    from cmbcov.assembly.filtering import mask_sin_theta_max
+
+    nside = 128
+    theta, _ = healpy.pix2ang(nside, np.arange(healpy.nside2npix(nside)))
+    resol = healpy.nside2resol(nside)
+    for lo, hi in ((30, 70), (10, 40), (100, 150)):
+        band = ((theta > lo * DEG) & (theta < hi * DEG)).astype(float)
+        nearest = min(abs(t - 90) for t in (lo, hi)) if not lo < 90 < hi else 0
+        expected = np.cos(nearest * DEG)
+        value = mask_sin_theta_max(band)
+        assert expected <= value <= np.cos(max(nearest * DEG - 2 * resol, 0))
+    # apodised: any W > 0 counts; the equator inside: 1; empty: 1
+    taper = np.clip((60 * DEG - theta) / (20 * DEG), 0, 1)
+    assert mask_sin_theta_max(taper) >= np.sin(60 * DEG)
+    assert mask_sin_theta_max(np.ones(healpy.nside2npix(8))) == 1.0
+    assert mask_sin_theta_max(np.zeros(healpy.nside2npix(8))) == 1.0
 
 
 #: The ring filters method="alm" is checked with: theta-dependent (high-pass,

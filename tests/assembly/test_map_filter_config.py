@@ -1727,14 +1727,20 @@ def test_generator_notch_reaches_the_plan_the_profile_and_the_identity(
     identity, profile = identities[1], profiles[1]
     assert set(identity) == OLD_IDENTITY_KEYS | {"notch"}
     assert identity["notch"] == NOTCH_M
-    # the plan gains the notch nodes (from round(0.95 m_lo) = 7); the rest
-    # of the identity is unchanged
-    plan_keys = {"notch", "nodes", "nprobe", "lmax_int_floor"}
-    assert 7 in identity["nodes"] and 7 not in identities[0]["nodes"]
-    assert {k: v for k, v in identity.items() if k not in plan_keys} == {
-        k: v for k, v in identities[0].items() if k not in plan_keys
-    }
-    assert fake_filtering.plan_calls[1]["notch"] == (NOTCH_M["m_lo"], NOTCH_M["m_hi"])
+    # the rest of the identity is unchanged (the nodes too: this mask reaches
+    # sin(theta) = 0.65, so the notch acts from 7.2 / 0.65 = 11, where the
+    # high-pass already has dense nodes)
+    assert {k: v for k, v in identity.items() if k != "notch"} == identities[0]
+    call = fake_filtering.plan_calls[1]
+    assert call["notch"] == (NOTCH_M["m_lo"], NOTCH_M["m_hi"])
+    import healpy as hp
+
+    from cmbcov.assembly.filtering import mask_sin_theta_max
+
+    mask = hp.read_map(os.path.join(str(tmp_path / "1"), MASK))
+    assert call["notch_sin_max"] == mask_sin_theta_max(mask)
+    assert 0.6 < call["notch_sin_max"] < 0.7
+    assert "notch_sin_max" not in fake_filtering.plan_calls[0]
     assert profile.func is fake_filtering.combined_profile
     assert profile.keywords == {
         "lx": 12,
@@ -1799,8 +1805,8 @@ def test_generator_method_reaches_the_white_probes_only(tmp_path, fake_filtering
 def test_real_run_notch_and_alm_method(tmp_path):
     """
     End to end with the real probing: a notch far above the band changes no
-    ratio but has its own cache file; a notch inside the band adds its nodes
-    and changes the ratios at the nodes both runs share (same probes there).
+    ratio but has its own cache file; a notch inside the band changes the
+    ratios at the same nodes (same probes there).
 
     The test mask is symmetric about the pole to round-off (1e-14 of its
     power in m > 0, i.e. 1e-7 in amplitude), so ``method: alm`` runs, with
@@ -1821,9 +1827,10 @@ def test_real_run_notch_and_alm_method(tmp_path):
         runs[name] = _real_run(workdir, None, kernels, **extra)[1]
     assert len(os.listdir(kernels / "filtered_sum_rule")) == 4
     plain, huge, band, alm = (runs[k] for k in ("plain", "huge", "band", "alm"))
-    assert 7 in band["nodes"] and 7 not in plain["nodes"]  # round(0.95 m_lo)
+    # this mask reaches sin(theta) = 0.65: the notch acts from 11, where the
+    # high-pass already has dense nodes, so the nodes are the same
+    assert band["nodes"].tolist() == plain["nodes"].tolist()
     shared = np.isin(band["nodes"], plain["nodes"])
-    assert shared.sum() == plain["nodes"].size
     assert np.all(2 * plain["nodes"] + 1 <= plain["nprobe"])  # complete basis
     for ch in plain["channels"]:
         assert np.array_equal(huge[f"g_{ch}"], plain[f"g_{ch}"]), ch

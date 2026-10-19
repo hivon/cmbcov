@@ -204,6 +204,7 @@ __all__ = [
     "lowpass_profile",
     "scan_m",
     "notch_profile",
+    "mask_sin_theta_max",
     "combined_profile",
     "FourierRingFilter",
     "default_nodes",
@@ -610,15 +611,19 @@ LOWPASS_DIVISOR = 15
 #: ``lx_lowpass`` are spaced ``lx_lowpass / LOWPASS_ONSET_DIVISOR`` apart.
 LOWPASS_ONSET_RANGE = (0.95, 1.15)
 LOWPASS_ONSET_DIVISOR = 50
-#: Nodes of a notch ``[m_lo, m_hi]`` (:func:`notch_profile`): geometric,
-#: a factor ``NOTCH_RATIO`` apart, from ``round(NOTCH_START m_lo)`` to the
-#: last node (:func:`default_nodes`, Notes).  A mode of order ``m`` lives
-#: where ``sin(theta) >= m / l``, so the notch changes :math:`\rho` from
-#: about ``m_lo / sin(theta_max)`` of the mask to beyond ``m_hi /
-#: sin(theta_min)``: the mask's latitude range, not the notch width, sets
-#: where, and the nodes cover every degree it can reach.
-NOTCH_START = 0.95
-NOTCH_RATIO = 1.03
+#: Nodes of a notch ``[m_lo, m_hi]`` (:func:`notch_profile`), graded
+#: about its onset ``l_on = m_lo / sin(theta_max)`` (``theta_max`` the
+#: mask's colatitude nearest the equator, :func:`mask_sin_theta_max`): a
+#: mode of order ``m`` lives where ``sin(theta) >= m / l``, so the notch
+#: leaves :math:`\rho` unchanged below ``l_on`` and changes it from there
+#: to beyond ``m_hi / sin(theta_min)``, the mask's latitude range, not the
+#: notch width, setting where.  Nodes a factor ``NOTCH_RATIO_FINE`` apart
+#: from ``NOTCH_FINE_RANGE[0] l_on`` through the onset to
+#: ``NOTCH_FINE_RANGE[1] l_on``, then ``NOTCH_RATIO_COARSE`` apart to the
+#: last node (:func:`default_nodes`, Notes).
+NOTCH_FINE_RANGE = (0.95, 1.25)
+NOTCH_RATIO_FINE = 1.03
+NOTCH_RATIO_COARSE = 1.08
 
 
 def _check_lowpass_cut(lx: float, lx_lowpass: float, shape: str) -> float:
@@ -648,18 +653,53 @@ def _round_half_up(x: float) -> int:
     return int(np.floor(x + 0.5))
 
 
-def _notch_nodes(m_lo: float, last: int, groups: list) -> list[int]:
-    """The nodes of a notch (:data:`NOTCH_START`, :data:`NOTCH_RATIO`):
-    ``n_0 = round(0.95 m_lo)`` (at least 1), ``n_{k+1} = max(round(1.03
-    n_k), n_k + 1)`` up to ``last``, without those inside the span of
-    another range of dense nodes (``groups``, ``(nodes, step)`` pairs),
-    which already sample it more finely."""
+def mask_sin_theta_max(mask: np.ndarray) -> float:
+    r"""
+    :math:`\sin\theta_{\max}` of a HEALPix mask: the largest
+    :math:`\sin\theta` over its pixels with ``W > 0``, each pixel's
+    colatitude moved toward the equator by the pixel resolution, so that the
+    value errs high (an earlier notch onset, :data:`NOTCH_FINE_RANGE`).
+    The map must be in the scan frame (its polar axis the scan axis), like
+    every input of this module.  An empty mask gives 1.
+    """
+    import healpy as hp  # lazy, see utils/healpy_utils.py
+
+    mask = np.asarray(mask, dtype=float)
+    nside = hp.npix2nside(mask.size)
+    theta, _ = hp.pix2ang(nside, np.flatnonzero(mask > 0))
+    if theta.size == 0:
+        return 1.0
+    resol = hp.nside2resol(nside)
+    nearest = np.clip(np.abs(theta - 0.5 * np.pi) - resol, 0.0, None)
+    return float(np.cos(nearest.min()))
+
+
+def _notch_onset(m_lo: float, sin_max: float) -> float:
+    """``l_on = m_lo / sin_max``, the degree from which a notch from
+    ``m_lo`` reaches a mask whose ``sin(theta)`` is at most ``sin_max``."""
+    return m_lo / sin_max
+
+
+def _notch_ratio(n: float, onset: float) -> float:
+    """Ratio of the notch nodes at ``n``: fine through the onset, coarse
+    above (:data:`NOTCH_FINE_RANGE`)."""
+    return NOTCH_RATIO_FINE if n < NOTCH_FINE_RANGE[1] * onset else NOTCH_RATIO_COARSE
+
+
+def _notch_nodes(m_lo: float, sin_max: float, last: int, groups: list) -> list[int]:
+    """The nodes of a notch (:data:`NOTCH_FINE_RANGE`): ``n_0 = round(0.95
+    l_on)`` (at least 1, ``l_on = m_lo / sin_max``), ``n_{k+1} =
+    max(round(r n_k), n_k + 1)`` up to ``last``, ``r`` 1.03 below ``1.25
+    l_on`` and 1.08 above, without those inside the span of another range of
+    dense nodes (``groups``, ``(nodes, step)`` pairs), which already sample
+    it more finely."""
+    onset = _notch_onset(m_lo, sin_max)
     out = []
-    n = max(1, _round_half_up(NOTCH_START * m_lo))
+    n = max(1, _round_half_up(NOTCH_FINE_RANGE[0] * onset))
     while n <= last:
         if all(not (d[0] <= n <= d[-1]) for d, _ in groups):
             out.append(n)
-        n = max(_round_half_up(NOTCH_RATIO * n), n + 1)
+        n = max(_round_half_up(_notch_ratio(n, onset) * n), n + 1)
     return out
 
 
@@ -673,6 +713,7 @@ def default_nodes(
     lx_lowpass: float | None = None,
     lowpass_shape: str = "exp",
     notch: tuple[float, float] | None = None,
+    notch_sin_max: float = 1.0,
 ) -> list[int]:
     r"""
     Multipoles at which :math:`\rho` is computed: geometric, ending at
@@ -712,10 +753,17 @@ def default_nodes(
         Edges ``(m_lo, m_hi)``, in azimuthal order, of a time-frequency
         notch (:func:`notch_profile`); needs ``lx``.  ``None`` (the
         default): no notch nodes, and the list is exactly the one without
-        this argument.  Otherwise geometric nodes a factor 1.03 apart from
-        ``round(0.95 m_lo)`` to ``lmax - 1`` are added (:func:`_notch_nodes`;
-        none inside the other dense ranges), and a geometric node closer to
-        one of them than half the local spacing, ``0.015 l``, is dropped.
+        this argument.  Otherwise nodes graded about the onset ``l_on =
+        m_lo / notch_sin_max`` are added: a factor 1.03 apart from
+        ``round(0.95 l_on)`` to ``1.25 l_on``, then 1.08 apart to ``lmax -
+        1`` (:func:`_notch_nodes`; none inside the other dense ranges), and
+        a geometric node closer to one of them than half the local spacing
+        is dropped.
+    notch_sin_max : float
+        :math:`\sin\theta_{\max}` of the mask in the scan frame,
+        :func:`mask_sin_theta_max`, in ``(0, 1]``.  The default 1 puts the
+        onset at ``m_lo``, right for any mask but with fine nodes below
+        the onset of a mask away from the equator.
 
     Returns
     -------
@@ -778,23 +826,24 @@ def default_nodes(
     was interpolated between nodes a factor 1.25 apart to 0.16%).
 
     **Notch nodes.**  Measured with exact rows (``method="alm"``) of a band
-    mask symmetric about the pole (colatitude 20-80 deg with the
-    apodisation, band-limit 256, coupling width 19), ``lmax`` 3500,
+    mask symmetric about the pole (non-zero at colatitude 30-70 deg, full
+    weight 40-60 deg, band-limit 256, coupling width 19), ``lmax`` 3500,
     ``dmax`` 99, sharp high-pass 300, notch 4.03-4.09 Hz at 1 deg/s
     (``M`` 1450.8-1472.4; ``examples/notch_node_study.py``).  The notch
     left :math:`\rho` unchanged up to ``l' = 1550``, then lowered it by up
-    to 2.4% (``l'`` 2250) and still 0.6% at 3499: it acts from ``m_lo /
-    sin(theta_max)`` of the mask on, over a range set by the mask's
-    latitudes, not near the notch alone.  PCHIP through the exact values at
-    the nodes, against every other exact row from 1100 up: the geometric
-    nodes alone 0.85% off at ``d = 0`` (2.9% for ``d <= 19``); nodes a
-    factor 1.05 apart from ``0.95 m_lo`` 0.14% (1.1%), 1.03 apart 0.02%
-    (0.5%); a first plan of nodes concentrated at the two edges (to ``2
-    m_hi``) 0.06% (1.7%, beyond its last node) at 2.3 times the cost.  The
-    notch nodes take ``nprobe``: :math:`\rho` stays near 0.9 there, and 32
-    random probes were 0.11-0.15% off at ``d = 0`` (0.4-0.6% for ``d <=
-    19``), 128 probes 0.03-0.07% (0.3%); the near-cut count pays off only
-    where few modes survive.
+    to 2.4% (``l'`` 2250) and still 0.6% at 3499.  Its features sit at
+    ``m / sin(theta)`` of the mask's edges: the onset at ``m_lo / sin 70``
+    = 1544, full weight from 1675, the peak at ``m / sin 40`` = 2257, a
+    bump near ``m / sin 30`` = 2900.  PCHIP through the exact values at the
+    nodes, against every other exact row from 1100 up, with the costs of the
+    whole run relative to the run without the notch: no notch nodes 0.85%
+    off at ``d = 0`` (2.9% for ``d <= 19``); nodes a factor 1.05 apart from
+    ``0.95 m_lo`` to ``lmax`` 0.16% (1.5%) at 3.1, 1.03 apart 0.05% (0.65%)
+    at 4.5; graded as here (1.03 apart to ``1.25 l_on``, 1.08 above) 0.06%
+    (0.56%) at 2.4, the errors sitting at the onset.  The notch nodes take ``nprobe``: :math:`\rho`
+    stays near 0.9 there, and 32 random probes were 0.11-0.15% off at ``d =
+    0`` (0.4-0.6% for ``d <= 19``), 128 probes 0.03-0.07% (0.3%); the
+    near-cut count pays off only where few modes survive.
     """
     lmax = int(lmax)
     node_min = int(node_min)
@@ -838,6 +887,9 @@ def default_nodes(
         lx_lowpass = _check_lowpass_cut(lx, lx_lowpass, lowpass_shape)
     if notch is not None:
         notch = _check_notch(*notch)
+        notch_sin_max = float(notch_sin_max)
+        if not 0 < notch_sin_max <= 1:
+            raise ValueError(f"notch_sin_max must lie in (0, 1], got {notch_sin_max}")
     if near_cut_step is not None and float(near_cut_step) == 0:
         return nodes
     step = _near_cut_step(lx, near_cut_step)
@@ -871,9 +923,11 @@ def default_nodes(
             )
         groups.extend(lp_groups)
     if notch is not None:
-        notch_nodes = _notch_nodes(notch[0], last, groups)
+        notch_nodes = _notch_nodes(notch[0], notch_sin_max, last, groups)
         if notch_nodes:
-            groups.append((notch_nodes, None))  # None: the local spacing
+            onset = _notch_onset(notch[0], notch_sin_max)
+            # the local spacing of the graded nodes
+            groups.append((notch_nodes, lambda n: (_notch_ratio(n, onset) - 1) * n))
     if not groups:
         return nodes
     kept = [
@@ -882,8 +936,7 @@ def default_nodes(
         if n == last
         or all(
             not (d[0] <= n <= d[-1])
-            or np.abs(np.array(d) - n).min()
-            >= 0.5 * (st if st is not None else (NOTCH_RATIO - 1) * n)
+            or np.abs(np.array(d) - n).min() >= 0.5 * (st(n) if callable(st) else st)
             for d, st in groups
         )
     ]
@@ -913,6 +966,7 @@ def node_plan(
     lx_lowpass: float | None = None,
     lowpass_shape: str = "exp",
     notch: tuple[float, float] | None = None,
+    notch_sin_max: float = 1.0,
 ) -> NodePlan:
     r"""
     Nodes and per-node probe settings of a filter with cut ``lx``, for
@@ -921,8 +975,10 @@ def node_plan(
 
     Parameters
     ----------
-    lmax, node_min, ratio, lx, near_cut_step, lx_lowpass, lowpass_shape, notch :
+    lmax, node_min, ratio, lx, near_cut_step, lx_lowpass, lowpass_shape :
         As for :func:`default_nodes` (``lx`` required here).
+    notch, notch_sin_max :
+        As for :func:`default_nodes`.
     nprobe : int
         Random probes of the other nodes.
     nprobe_near_cut : int, optional
@@ -992,6 +1048,7 @@ def node_plan(
         lx_lowpass=lx_lowpass,
         lowpass_shape=lowpass_shape,
         notch=notch,
+        notch_sin_max=notch_sin_max,
     )
     nprobe = int(nprobe)
     if nprobe < 1:

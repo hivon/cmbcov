@@ -430,44 +430,65 @@ mask's latitude range, not the notch width, sets where $\rho$ changes,
 and a narrow notch moves $\rho$ over a wide range of $\ell$.
 
 Measured with exact rows (`method: alm`, below) on a band mask symmetric
-about the pole (colatitude 20-80° including a 10° apodisation, band-limit
-256, coupling width 19), `lmax` 3500, `dmax` 99, sharp high-pass at 300 and
-a notch at 4.03-4.09 Hz scanned at 1 deg/s ($M$ = 1450.8-1472.4), the
-notch changes $\rho$ at $d = 0$ by
+about the pole (non-zero at colatitude 30-70°, full weight 40-60°,
+band-limit 256, coupling width 19), `lmax` 3500, `dmax` 99, sharp high-pass
+at 300 and a notch at 4.03-4.09 Hz scanned at 1 deg/s ($M$ =
+1450.8-1472.4), the notch changes $\rho$ at $d = 0$ by
 
 | $\ell'$ | $\le 1550$ | 1650 | 1800 | 2250 | 2800 | 3499 |
 | --- | --- | --- | --- | --- | --- | --- |
 | $\rho_{\mathrm{notch}} / \rho - 1$ | 0 | −0.3% | −1.7% | −2.4% | −1.0% | −0.6% |
 
-(up to 5% for $d \le 99$).
+(up to 5% for $d \le 99$). Its features sit at $m / \sin\theta$ of the
+mask's edges: the onset at $m_{\mathrm{lo}} / \sin 70° = 1544$, full
+weight from 1675 ($\sin 60°$), the peak at $m / \sin 40° = 2257$, a bump
+near $m / \sin 30° \approx 2900$.
 
-**Nodes.** The notch therefore adds geometric nodes a factor 1.03 apart from
-$0.95\thinspace m_{\mathrm{lo}}$ up to $\ell_{\max} - 1$, with the
-ordinary probe count `nprobe`. Interpolating (PCHIP, as `rho_matrix` does)
-the exact values at the nodes of each plan and comparing with the exact
-values at all other 212 reference rows between 1100 and 3499, using only
-the separations $d$ the mask actually couples (beyond its coupling width
-both sums are round-off and their ratio is noise):
+**Nodes.** The notch nodes are graded about the onset
+$\ell_{\mathrm{on}} = m_{\mathrm{lo}} / \sin\theta_{\max}$: a factor 1.03
+apart from $0.95\thinspace\ell_{\mathrm{on}}$ to
+$1.25\thinspace\ell_{\mathrm{on}}$, where $\rho$ turns over fastest, then
+1.08 apart up to $\ell_{\max} - 1$, all with the ordinary probe count
+`nprobe`. The run reads $\sin\theta_{\max}$ from the mask: the largest
+$\sin\theta$ over the pixels with $W > 0$, each moved toward the equator by
+one pixel so that it errs high (an earlier onset, never a missed one); it
+logs it and records it as `derived.map_filter.notch_sin_max` in
+`params_resolved.yml`. Interpolating (PCHIP, as `rho_matrix` does) the exact
+values at the nodes of each plan and comparing with the exact values at all
+other reference rows between 1100 and 3499, using only the separations $d$
+the mask actually couples (beyond its coupling width both sums are
+round-off and their ratio is noise):
 
-| nodes | relative cost | $d = 0$ | $d \le 19$ |
+| notch nodes | relative cost | $d = 0$ | $d \le 19$ |
 | --- | --- | --- | --- |
-| geometric ×1.25 only (no notch nodes) | 1.0 | 0.85% | 2.9% |
-| dense at both edges up to $2\thinspace m_{\mathrm{hi}}$, 128 probes (first version) | 7.8 | 0.06% | 1.7% |
-| ×1.05 from $0.95\thinspace m_{\mathrm{lo}}$ to $\ell_{\max}$, 32 probes | 3.5 | 0.14% | 1.1% |
-| **×1.03 from $0.95\thinspace m_{\mathrm{lo}}$ to $\ell_{\max}$, 32 probes** | **4.5** | **0.02%** | **0.5%** |
+| none (geometric ×1.25 only) | 1.0 | 0.85% | 2.9% |
+| dense at both edges to $2\thinspace m_{\mathrm{hi}}$, 128 probes (first version) | 7.8 | 0.06% | 1.7% |
+| ×1.05 from $0.95\thinspace m_{\mathrm{lo}}$ to $\ell_{\max}$ | 3.1 | 0.16% | 1.5% |
+| ×1.03 from $0.95\thinspace m_{\mathrm{lo}}$ to $\ell_{\max}$ (second version) | 4.5 | 0.05% | 0.65% |
+| **graded: ×1.03 to $1.25\thinspace\ell_{\mathrm{on}}$, ×1.08 above** | **2.4** | **0.06%** | **0.56%** |
 
-(cost: probes times $\ell_{\mathrm{int}}^3$ summed over the nodes, relative
-to the run without the notch). The first version's largest error was beyond
-its last node, where the effect is still 1%. The probe noise is small
-because $\rho$ stays near 0.9: against the exact values, 32 random probes
-were 0.11-0.15% off at $d = 0$ (0.4-0.6% for $d \le 19$), 128 probes
+(cost: probes times $\ell_{\mathrm{int}}^3$ summed over all the run's nodes,
+relative to the run without the notch; 32 probes at the notch nodes except
+for the first version). The errors sit at the onset, so the coarser nodes
+above it lose nothing; the first version's largest error was beyond its
+last node, where the effect is still 1%. Here $\ell_{\mathrm{on}}$ is 1542
+against $m_{\mathrm{lo}} = 1451$, so reading the mask saves little; for a
+field away from the equator, say $\theta_{\max} = 50°$, the onset moves to
+1894 and no node is spent below it. The probe noise is small because
+$\rho$ stays near 0.9: against the exact values, 32 random probes were
+0.11-0.15% off at $d = 0$ (0.4-0.6% for $d \le 19$), 128 probes
 0.03-0.07% (0.3%); the near-cut count only pays where few modes survive, as
 near the high-pass cut. For $19 < d \le 38$ all plans are 1.5-3% off: the
 off-diagonal limit of the (mean, distance) interpolation already noted for
-the sharp low-pass. A real mask has a wider coupling, which smooths
-$\rho$; its own latitude range moves the footprint, which nodes up to
-$\ell_{\max}$ cover whatever it is. The study is
-`examples/notch_node_study.py`.
+the sharp low-pass.
+
+These ratios were set on one symmetric band. A real mask has a wider
+coupling, which smooths $\rho$, but sharper edges or several latitude
+features (each at $m / \sin\theta$ of an edge) could need finer nodes above
+the onset; and its limits in longitude mix orders, which a symmetric mask
+cannot show. The study is `examples/notch_node_study.py`; running it on the
+azimuthal average $\bar W(\theta)$ of a real mask checks the latitude
+structure of that mask.
 
 ### Exact ratios for a symmetric mask (`method: alm`)
 

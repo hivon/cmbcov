@@ -660,16 +660,27 @@ class CovarianceMatrixGenerator:
         )
         # Likewise the notch, in azimuthal order M = 360 f / v_az.
         notch = None if settings.notch is None else settings.notch.as_dict()
+        sin_max = None
         if notch is not None:
+            # Its nodes are graded about the onset m_lo / sin(theta_max) of
+            # the mask (an alm mask: 1, the onset at m_lo, safe for any mask).
+            mask = np.asarray(cov.wlm.mask)
+            sin_max = (
+                1.0 if np.iscomplexobj(mask) else filtering.mask_sin_theta_max(mask)
+            )
             low_args["notch"] = (notch["m_lo"], notch["m_hi"])
+            low_args["notch_sin_max"] = sin_max
             self.logger.info(
                 "map_filter: notch %s-%s Hz at %s deg/s removes the azimuthal "
-                "orders %.2f <= |M| <= %.2f",
+                "orders %.2f <= |M| <= %.2f; the mask reaches sin(theta) = %.4f, "
+                "so the notch acts from l = %.0f",
                 settings.notch.f_lo,
                 settings.notch.f_hi,
                 settings.notch.v_az,
                 notch["m_lo"],
                 notch["m_hi"],
+                sin_max,
+                notch["m_lo"] / sin_max,
             )
         plan = filtering.node_plan(
             lmax,
@@ -752,7 +763,7 @@ class CovarianceMatrixGenerator:
                 "nodes": nodes,
                 "nprobe": nprobe,
                 "lmax_int_floor": floors,
-                **({} if notch is None else {"notch": notch}),
+                **({} if notch is None else {"notch": notch, "notch_sin_max": sin_max}),
             }
         )
         cov.config.filter_rho = None

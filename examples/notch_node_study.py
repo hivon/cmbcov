@@ -8,7 +8,9 @@ probe noise. This script computes it on a dense grid of ``l'`` through the
 range a time-frequency notch can reach, then:
 
 * the effect of the notch, ``g_notched / g_highpass - 1``;
-* the interpolation error of candidate node plans: PCHIP in ``ln l'`` (as
+* the interpolation error and the cost of candidate node plans, among them
+  the plan ``filtering.default_nodes`` makes (graded about the onset
+  ``m_lo / sin(theta_max)`` of the mask): PCHIP in ``ln l'`` (as
   ``rho_matrix``) through the exact values at the plan's nodes, against the
   exact values at every other reference row;
 * the probe noise: random probes (``method="map"``) against the exact values
@@ -20,7 +22,8 @@ ratio is noise, multiplying covariance elements that are essentially zero.
 
 The defaults are the case of docs/theory/filter_and_bin.md, "The notch":
 ``lmax`` 3500, sharp high-pass at 300, notch 4.03-4.09 Hz at 1 deg/s, a band
-mask at colatitude 30-70 deg with a 10 deg apodisation (band-limit 256).
+mask non-zero at colatitude 30-70 deg with 10 deg apodisations (full weight
+40-60 deg, band-limit 256).
 That takes about an hour on 8 cores; ``--quick`` runs a small version.
 
 Usage
@@ -52,7 +55,11 @@ def _taper(x):
     return np.sin(0.5 * np.pi * x) ** 2
 
 
-def band_mask(lw, theta=(30.0, 70.0), apod=10.0):
+#: Colatitudes (deg) where the band mask is non-zero; its apodisation width.
+BAND, APOD = (30.0, 70.0), 10.0
+
+
+def band_mask(lw, theta=BAND, apod=APOD):
     """alm of a band in colatitude (degrees), symmetric about the pole."""
     lg = 2 * lw
     th = gl_thetas(lg)
@@ -116,6 +123,9 @@ def compute(args):
     np.savez(
         args.out,
         m=[m_lo, m_hi],
+        lx=args.lx,
+        dmax=args.dmax,
+        sin_max=max(np.sin(t * DEG) for t in BAND) if BAND[1] < 90 else 1.0,
         width=width,
         lmax=args.lmax,
         base_nodes=base.nodes,
@@ -160,16 +170,38 @@ def analyse(path):
         t = 0.95 * m_lo * ratio ** np.arange(400)
         return base + snap(t[t <= last])
 
+    def cost(nodes):
+        """32 probes per node, ~ lmax_int^3 each, relative to ``base``."""
+        lmax_int = int(r["dmax"]) + width
+
+        def total(ns):
+            return sum((n + lmax_int) ** 3 for n in set(ns))
+
+        return total(nodes) / total(base)
+
+    graded = filtering.default_nodes(
+        last + 1,
+        lx=float(r["lx"]),
+        notch=(m_lo, m_hi),
+        notch_sin_max=float(r["sin_max"]),
+    )
     plans = {"geometric x1.25 only": base}
     for ratio in (1.10, 1.05, 1.03, 1.02):
         plans[f"x{ratio} from 0.95 m_lo"] = geometric(ratio)
+    plans["default (graded)"] = base + snap([n for n in graded if n >= rows[0]])
     print(
-        f"\n{'plan':26s} {'nodes':>5s} {'d=0':>8s} {f'd<={width}':>8s} {f'd<={d_far}':>8s}"
+        f"\nsin(theta_max) of the mask {float(r['sin_max']):.4f}: onset "
+        f"{m_lo / float(r['sin_max']):.0f}; cost relative to the x1.25 nodes"
+    )
+    print(
+        f"{'plan':26s} {'nodes':>5s} {'cost':>5s} {'d=0':>8s} {f'd<={width}':>8s} "
+        f"{f'd<={d_far}':>8s}"
     )
     for name, nodes in plans.items():
         errs = [error(nodes, d) * 100 for d in (0, width, d_far)]
         print(
-            f"{name:26s} {len(set(nodes)):5d} " + " ".join(f"{e:7.3f}%" for e in errs)
+            f"{name:26s} {len(set(nodes)):5d} {cost(nodes):5.2f} "
+            + " ".join(f"{e:7.3f}%" for e in errs)
         )
 
     print("\nprobe noise, |map - exact|:")
